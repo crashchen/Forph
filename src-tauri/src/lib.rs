@@ -38,6 +38,7 @@ pub struct MediaInfo {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RuntimeInfo {
+    brew_available: bool,
     ffmpeg_available: bool,
     ffprobe_available: bool,
     whisper_available: bool,
@@ -47,6 +48,12 @@ pub struct RuntimeInfo {
     base_model_available: bool,
     base_model_path: Option<String>,
     using_legacy_model_directory: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DependencyInstallResult {
+    package_name: String,
+    message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,19 +93,53 @@ struct ModelLookup {
 
 // ─── Helpers ─────────────────────────────────────────────
 
-fn has_command(cmd: &str) -> bool {
-    StdCommand::new("which")
+fn resolve_command_path(cmd: &str) -> Option<PathBuf> {
+    let cmd_path = PathBuf::from(cmd);
+    if cmd_path.is_absolute() && cmd_path.exists() {
+        return Some(cmd_path);
+    }
+
+    let from_path = StdCommand::new("which")
         .arg(cmd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+
+    if from_path.is_some() {
+        return from_path;
+    }
+
+    ["/opt/homebrew/bin", "/usr/local/bin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(cmd))
+        .find(|path| path.exists())
 }
 
-fn find_whisper_command() -> Option<&'static str> {
-    if has_command("whisper-cpp") {
-        Some("whisper-cpp")
-    } else if has_command("whisper") {
-        Some("whisper")
+fn has_command(cmd: &str) -> bool {
+    resolve_command_path(cmd).is_some()
+}
+
+fn brew_command_path() -> Option<PathBuf> {
+    resolve_command_path("brew")
+}
+
+fn ffmpeg_command_path() -> Option<PathBuf> {
+    resolve_command_path("ffmpeg")
+}
+
+fn ffprobe_command_path() -> Option<PathBuf> {
+    resolve_command_path("ffprobe")
+}
+
+fn find_whisper_command() -> Option<PathBuf> {
+    if let Some(path) = resolve_command_path("whisper-cpp") {
+        Some(path)
+    } else if let Some(path) = resolve_command_path("whisper") {
+        Some(path)
     } else {
         None
     }
@@ -203,8 +244,9 @@ fn runtime_info(app: &AppHandle) -> RuntimeInfo {
     let lookup = inspect_models(app, "base");
 
     RuntimeInfo {
-        ffmpeg_available: has_command("ffmpeg"),
-        ffprobe_available: has_command("ffprobe"),
+        brew_available: brew_command_path().is_some(),
+        ffmpeg_available: ffmpeg_command_path().is_some(),
+        ffprobe_available: ffprobe_command_path().is_some(),
         whisper_available: find_whisper_command().is_some(),
         available_models: lookup.available_models,
         model_directory: Some(lookup.current_directory.to_string_lossy().to_string()),
@@ -234,11 +276,9 @@ fn round_duration(value: f64) -> f64 {
 }
 
 fn probe_media_info(path: &str) -> Option<MediaInfo> {
-    if !has_command("ffprobe") {
-        return None;
-    }
+    let ffprobe = ffprobe_command_path()?;
 
-    let output = StdCommand::new("ffprobe")
+    let output = StdCommand::new(ffprobe)
         .args([
             "-v",
             "error",
@@ -515,6 +555,22 @@ fn is_probably_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
+fn dependency_is_installed(package_name: &str) -> bool {
+    match package_name {
+        "ffmpeg" => has_command("ffmpeg"),
+        "whisper-cpp" => find_whisper_command().is_some(),
+        _ => false,
+    }
+}
+
+fn dependency_display_name(package_name: &str) -> Option<&'static str> {
+    match package_name {
+        "ffmpeg" => Some("FFmpeg"),
+        "whisper-cpp" => Some("whisper-cpp"),
+        _ => None,
+    }
+}
+
 // ─── Commands ────────────────────────────────────────────
 
 #[tauri::command]
@@ -667,9 +723,9 @@ async fn video_to_gif(
     start_time: Option<f64>,
     duration: Option<f64>,
 ) -> Result<ConversionResult, String> {
-    if !has_command("ffmpeg") {
+    let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg: brew install ffmpeg".into());
-    }
+    };
 
     let media = probe_media_info(&input_path);
     let (start, clip_duration) = clamp_gif_window(
@@ -702,7 +758,7 @@ async fn video_to_gif(
         out_str.clone(),
     ];
 
-    let r = StdCommand::new("ffmpeg")
+    let r = StdCommand::new(ffmpeg)
         .args(&args)
         .output()
         .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
@@ -730,9 +786,9 @@ async fn extract_audio(
     input_path: String,
     output_format: String,
 ) -> Result<ConversionResult, String> {
-    if !has_command("ffmpeg") {
+    let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg: brew install ffmpeg".into());
-    }
+    };
 
     let out = make_output_path(&input_path, &output_format);
     let out_str = out.to_string_lossy().to_string();
@@ -761,7 +817,7 @@ async fn extract_audio(
         _ => return Err(format!("不支持的音频格式: {}", output_format)),
     };
 
-    let r = StdCommand::new("ffmpeg")
+    let r = StdCommand::new(ffmpeg)
         .args(args)
         .output()
         .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
@@ -810,8 +866,8 @@ async fn transcribe_audio(
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    if has_command("ffmpeg") {
-        let r = StdCommand::new("ffmpeg")
+    if let Some(ffmpeg) = ffmpeg_command_path() {
+        let r = StdCommand::new(ffmpeg)
             .args([
                 "-y",
                 "-i",
@@ -876,6 +932,64 @@ async fn transcribe_audio(
 }
 
 #[tauri::command]
+async fn install_dependency(package_name: String) -> Result<DependencyInstallResult, String> {
+    let Some(display_name) = dependency_display_name(&package_name) else {
+        return Err(format!("暂不支持自动安装依赖：{}", package_name));
+    };
+
+    let Some(brew) = brew_command_path() else {
+        return Err("未检测到 Homebrew。请先安装 Homebrew，再回来一键安装依赖。".into());
+    };
+
+    if dependency_is_installed(&package_name) {
+        return Ok(DependencyInstallResult {
+            package_name,
+            message: format!("{} 已经可用了。", display_name),
+        });
+    }
+
+    let package_name_for_install = package_name.clone();
+    let install_output = tauri::async_runtime::spawn_blocking(move || {
+        StdCommand::new(brew)
+            .args(["install", package_name_for_install.as_str()])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("安装任务执行失败: {}", error))?
+    .map_err(|error| format!("brew 调用失败: {}", error))?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr)
+            .trim()
+            .to_string();
+        let stdout = String::from_utf8_lossy(&install_output.stdout)
+            .trim()
+            .to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "brew 没有返回更多细节。".into()
+        };
+
+        return Err(format!("自动安装 {} 失败：{}", display_name, details));
+    }
+
+    if !dependency_is_installed(&package_name) {
+        return Err(format!(
+            "{} 安装过程已结束，但当前仍未检测到命令。可以稍后重试一次，或在终端运行 brew install {}。",
+            display_name, package_name
+        ));
+    }
+
+    Ok(DependencyInstallResult {
+        package_name,
+        message: format!("{} 安装完成，已准备好重新检测。", display_name),
+    })
+}
+
+#[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     StdCommand::new("open")
         .args(["-R", &path])
@@ -910,6 +1024,7 @@ pub fn run() {
             video_to_gif,
             extract_audio,
             transcribe_audio,
+            install_dependency,
             reveal_in_finder,
             open_target,
         ])

@@ -30,6 +30,7 @@ export interface MediaInfo {
 }
 
 export interface RuntimeInfo {
+  brew_available: boolean;
   ffmpeg_available: boolean;
   ffprobe_available: boolean;
   whisper_available: boolean;
@@ -39,6 +40,11 @@ export interface RuntimeInfo {
   base_model_available: boolean;
   base_model_path?: string | null;
   using_legacy_model_directory: boolean;
+}
+
+export interface DependencyInstallResult {
+  package_name: string;
+  message: string;
 }
 
 export type AppView =

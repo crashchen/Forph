@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   AlertTriangle,
   Download,
@@ -19,6 +19,8 @@ import {
   convertImage,
   exportMarkdown,
   extractAudio,
+  getFileInfo,
+  installDependency,
   openTarget,
   transcribeAudio,
   videoToGif,
@@ -28,13 +30,17 @@ interface FileActionsProps {
   file: FileInfo;
   isDragOver: boolean;
   onConversionStart: (actionId: string) => void;
+  onFileRefreshed: (file: FileInfo) => void;
   onResult: (result: ConversionResult) => void;
   onError: (error: string) => void;
   onReset: () => void;
 }
 
+type InstallableDependency = "ffmpeg" | "whisper-cpp";
+
 const MODEL_DOWNLOAD_URL =
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true";
+const HOMEBREW_URL = "https://brew.sh";
 const GIF_FILE_SIZE_WARNING_BYTES = 50 * 1024 * 1024;
 
 const typeIcons: Record<string, typeof Image> = {
@@ -284,14 +290,26 @@ export function FileActions({
   file,
   isDragOver,
   onConversionStart,
+  onFileRefreshed,
   onResult,
   onError,
   onReset,
 }: FileActionsProps) {
   const [showGifOptions, setShowGifOptions] = useState(false);
+  const [installingDependency, setInstallingDependency] =
+    useState<InstallableDependency | null>(null);
+  const [dependencyMessage, setDependencyMessage] = useState<string | null>(null);
+  const [dependencyError, setDependencyError] = useState<string | null>(null);
   const Icon = typeIcons[file.file_type] || FileText;
   const runtime = file.runtime;
   const mediaSummary = formatMediaSummary(file.file_type, file.media);
+
+  useEffect(() => {
+    setShowGifOptions(false);
+    setInstallingDependency(null);
+    setDependencyMessage(null);
+    setDependencyError(null);
+  }, [file.path]);
 
   const executeAction = useCallback(
     async (action: FileAction) => {
@@ -322,6 +340,26 @@ export function FileActions({
       }
     },
     [file, onConversionStart, onResult, onError],
+  );
+
+  const handleDependencyInstall = useCallback(
+    async (packageName: InstallableDependency) => {
+      setDependencyMessage(null);
+      setDependencyError(null);
+      setInstallingDependency(packageName);
+
+      try {
+        const result = await installDependency(packageName);
+        const refreshedFile = await getFileInfo(file.path);
+        onFileRefreshed(refreshedFile);
+        setDependencyMessage(`${result.message} 当前文件的可用动作也已经刷新。`);
+      } catch (e: any) {
+        setDependencyError(typeof e === "string" ? e : e.message || "自动安装失败");
+      } finally {
+        setInstallingDependency(null);
+      }
+    },
+    [file.path, onFileRefreshed],
   );
 
   const handleGifConvert = useCallback(
@@ -434,13 +472,37 @@ export function FileActions({
         <div className="mt-4 glass p-4 rounded-2xl text-left">
           <div className="flex items-start gap-3">
             <AlertTriangle size={16} className="text-warning shrink-0 mt-0.5" />
-            <div className="space-y-1.5">
+            <div className="space-y-2 w-full">
               <p className="text-sm font-medium text-white/78">
                 先装 FFmpeg，媒体转换才会完整可用
               </p>
               <p className="text-xs text-white/42 leading-relaxed">
                 GIF、音频提取，以及大多数视频 / 音频转写前处理都依赖 FFmpeg。
               </p>
+              <div className="flex flex-wrap gap-2">
+                {runtime.brew_available ? (
+                  <button
+                    disabled={installingDependency !== null}
+                    onClick={() => handleDependencyInstall("ffmpeg")}
+                    className={`no-drag px-4 py-2 rounded-xl text-sm font-medium transition-colors ${
+                      installingDependency !== null
+                        ? "cursor-not-allowed bg-white/6 text-white/28"
+                        : "cursor-pointer bg-accent/15 text-accent hover:bg-accent/25"
+                    }`}
+                  >
+                    {installingDependency === "ffmpeg"
+                      ? "正在安装 FFmpeg..."
+                      : "一键安装 FFmpeg"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => openTarget(HOMEBREW_URL)}
+                    className="no-drag px-4 py-2 rounded-xl bg-accent/15 text-accent text-sm font-medium hover:bg-accent/25 transition-colors cursor-pointer"
+                  >
+                    安装 Homebrew
+                  </button>
+                )}
+              </div>
               <code className="text-[11px] text-accent/70">
                 brew install ffmpeg
               </code>
@@ -453,16 +515,65 @@ export function FileActions({
         <div className="mt-4 glass p-4 rounded-2xl text-left">
           <div className="flex items-start gap-3">
             <AlertTriangle size={16} className="text-warning shrink-0 mt-0.5" />
-            <div className="space-y-1.5">
+            <div className="space-y-2 w-full">
               <p className="text-sm font-medium text-white/78">
                 先装 whisper-cpp，才能离线转写
               </p>
               <p className="text-xs text-white/42 leading-relaxed">
-                当前转写按钮已经先帮你收住了，装好之后重新拖入文件就能直接用。
+                当前转写按钮已经先帮你收住了，装好之后我会立刻帮你重新检测当前文件。
               </p>
+              <div className="flex flex-wrap gap-2">
+                {runtime.brew_available ? (
+                  <button
+                    disabled={installingDependency !== null}
+                    onClick={() => handleDependencyInstall("whisper-cpp")}
+                    className={`no-drag px-4 py-2 rounded-xl text-sm font-medium transition-colors ${
+                      installingDependency !== null
+                        ? "cursor-not-allowed bg-white/6 text-white/28"
+                        : "cursor-pointer bg-accent/15 text-accent hover:bg-accent/25"
+                    }`}
+                  >
+                    {installingDependency === "whisper-cpp"
+                      ? "正在安装 whisper-cpp..."
+                      : "一键安装 whisper-cpp"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => openTarget(HOMEBREW_URL)}
+                    className="no-drag px-4 py-2 rounded-xl bg-accent/15 text-accent text-sm font-medium hover:bg-accent/25 transition-colors cursor-pointer"
+                  >
+                    安装 Homebrew
+                  </button>
+                )}
+              </div>
               <code className="text-[11px] text-accent/70">
                 brew install whisper-cpp
               </code>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {(dependencyMessage || dependencyError) && (
+        <div className="mt-4 glass p-4 rounded-2xl text-left">
+          <div className="flex items-start gap-3">
+            <AlertTriangle
+              size={16}
+              className={`shrink-0 mt-0.5 ${
+                dependencyError ? "text-warning" : "text-success"
+              }`}
+            />
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-white/78">
+                {dependencyError ? "安装助手遇到了一点阻塞" : "安装助手已完成当前步骤"}
+              </p>
+              <p
+                className={`text-xs leading-relaxed ${
+                  dependencyError ? "text-white/42" : "text-white/55"
+                }`}
+              >
+                {dependencyError ?? dependencyMessage}
+              </p>
             </div>
           </div>
         </div>

@@ -1,5 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { FileInfo, ConversionResult } from "./types";
+import type {
+  ConversionResult,
+  DependencyInstallResult,
+  FileInfo,
+} from "./types";
 
 export async function getFileInfo(path: string): Promise<FileInfo> {
   return invoke("get_file_info", { path });
@@ -54,6 +58,12 @@ export async function transcribeAudio(
     modelSize,
     language: language ?? null,
   });
+}
+
+export async function installDependency(
+  packageName: "ffmpeg" | "whisper-cpp",
+): Promise<DependencyInstallResult> {
+  return invoke("install_dependency", { packageName });
 }
 
 export async function revealInFinder(path: string): Promise<void> {

@@ -116,6 +116,7 @@ export default function App() {
               onConversionStart={(actionId) =>
                 setView({ stage: "converting", file: view.file, actionId })
               }
+              onFileRefreshed={(file) => setView({ stage: "actions", file })}
               onResult={(result) =>
                 setView({ stage: "done", file: view.file, result })
               }
