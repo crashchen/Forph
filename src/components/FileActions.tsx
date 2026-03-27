@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   AlertTriangle,
   Download,
@@ -30,7 +30,7 @@ interface FileActionsProps {
   file: FileInfo;
   isDragOver: boolean;
   onConversionStart: (actionId: string) => void;
-  onFileRefreshed: (file: FileInfo) => void;
+  onFileRefreshed: (sourcePath: string, file: FileInfo) => void;
   onResult: (result: ConversionResult) => void;
   onError: (error: string) => void;
   onReset: () => void;
@@ -65,6 +65,18 @@ function formatDuration(seconds?: number | null): string | null {
   return `${mins}m ${secs}s`;
 }
 
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
 function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo | null) {
   if (!media) return null;
 
@@ -86,12 +98,8 @@ function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo |
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-function needsFfmpegForTranscription(file: FileInfo): boolean {
-  if (file.file_type === "video") {
-    return true;
-  }
-
-  return file.extension.toLowerCase() !== "wav";
+function requiresFfmpegForTranscription(): boolean {
+  return true;
 }
 
 function getActionDisabledReason(file: FileInfo, action: FileAction): string | null {
@@ -127,7 +135,7 @@ function getActionDisabledReason(file: FileInfo, action: FileAction): string | n
     if (!runtime.base_model_available) {
       return "缺少 ggml-base.bin 模型";
     }
-    if (needsFfmpegForTranscription(file) && !runtime.ffmpeg_available) {
+    if (requiresFfmpegForTranscription() && !runtime.ffmpeg_available) {
       return "当前文件转写前需要 FFmpeg 预处理";
     }
     if (action.id === "vid_transcribe" && media?.has_audio === false) {
@@ -303,8 +311,19 @@ export function FileActions({
   const Icon = typeIcons[file.file_type] || FileText;
   const runtime = file.runtime;
   const mediaSummary = formatMediaSummary(file.file_type, file.media);
+  const activeFilePathRef = useRef(file.path);
+  const installRequestIdRef = useRef(0);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    activeFilePathRef.current = file.path;
+    installRequestIdRef.current += 1;
     setShowGifOptions(false);
     setInstallingDependency(null);
     setDependencyMessage(null);
@@ -335,8 +354,8 @@ export function FileActions({
           throw new Error(`未知操作: ${action.id}`);
         }
         onResult(result);
-      } catch (e: any) {
-        onError(typeof e === "string" ? e : e.message || "转换失败");
+      } catch (error) {
+        onError(getErrorMessage(error, "转换失败"));
       }
     },
     [file, onConversionStart, onResult, onError],
@@ -344,19 +363,52 @@ export function FileActions({
 
   const handleDependencyInstall = useCallback(
     async (packageName: InstallableDependency) => {
+      const sourcePath = file.path;
+      const requestId = installRequestIdRef.current + 1;
+      installRequestIdRef.current = requestId;
       setDependencyMessage(null);
       setDependencyError(null);
       setInstallingDependency(packageName);
 
       try {
         const result = await installDependency(packageName);
-        const refreshedFile = await getFileInfo(file.path);
-        onFileRefreshed(refreshedFile);
+        if (
+          !isMountedRef.current ||
+          installRequestIdRef.current !== requestId ||
+          activeFilePathRef.current !== sourcePath
+        ) {
+          return;
+        }
+
+        const refreshedFile = await getFileInfo(sourcePath);
+        if (
+          !isMountedRef.current ||
+          installRequestIdRef.current !== requestId ||
+          activeFilePathRef.current !== sourcePath
+        ) {
+          return;
+        }
+
+        onFileRefreshed(sourcePath, refreshedFile);
         setDependencyMessage(`${result.message} 当前文件的可用动作也已经刷新。`);
-      } catch (e: any) {
-        setDependencyError(typeof e === "string" ? e : e.message || "自动安装失败");
+      } catch (error) {
+        if (
+          !isMountedRef.current ||
+          installRequestIdRef.current !== requestId ||
+          activeFilePathRef.current !== sourcePath
+        ) {
+          return;
+        }
+
+        setDependencyError(getErrorMessage(error, "自动安装失败"));
       } finally {
-        setInstallingDependency(null);
+        if (
+          isMountedRef.current &&
+          installRequestIdRef.current === requestId &&
+          activeFilePathRef.current === sourcePath
+        ) {
+          setInstallingDependency(null);
+        }
       }
     },
     [file.path, onFileRefreshed],
@@ -373,8 +425,8 @@ export function FileActions({
       try {
         const result = await videoToGif(file.path, fps, width, startTime, duration);
         onResult(result);
-      } catch (e: any) {
-        onError(typeof e === "string" ? e : e.message || "GIF 转换失败");
+      } catch (error) {
+        onError(getErrorMessage(error, "GIF 转换失败"));
       }
     },
     [file, onConversionStart, onResult, onError],

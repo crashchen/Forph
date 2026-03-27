@@ -14,16 +14,16 @@ export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
         {
           name: "Supported Files",
           extensions: [
-            "jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "tiff",
-            "md", "markdown",
-            "mp4", "mov", "avi", "mkv", "webm",
-            "mp3", "wav", "m4a", "aac", "ogg", "flac",
+            "jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "tiff", "tif",
+            "md", "markdown", "mdown",
+            "mp4", "mov", "avi", "mkv", "webm", "m4v",
+            "mp3", "wav", "m4a", "aac", "ogg", "flac", "wma",
           ],
         },
       ],
     });
-    if (selected) {
-      onFileDrop([selected as string]);
+    if (typeof selected === "string") {
+      onFileDrop([selected]);
     }
   };
 

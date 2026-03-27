@@ -6,9 +6,38 @@ import { FileActions } from "./components/FileActions";
 import { Converting } from "./components/Converting";
 import { ResultPanel } from "./components/ResultPanel";
 import { getFileInfo } from "./lib/commands";
-import type { AppView } from "./lib/types";
+import type { AppView, FileInfo } from "./lib/types";
 
 const appWindow = getCurrentWindow();
+
+function getErrorMessage(error: unknown): string {
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message;
+  }
+
+  return "读取文件时出了点问题，请换一个文件重试。";
+}
+
+function buildFallbackFileInfo(path: string): FileInfo {
+  const name = path.split("/").pop() || "unknown";
+  const dotIndex = name.lastIndexOf(".");
+  const extension = dotIndex >= 0 ? name.slice(dotIndex + 1).toLowerCase() : "";
+
+  return {
+    name,
+    path,
+    extension,
+    size: 0,
+    file_type: "unknown",
+    actions: [],
+    media: null,
+    runtime: null,
+  };
+}
 
 export default function App() {
   const [view, setView] = useState<AppView>({ stage: "idle" });
@@ -27,8 +56,13 @@ export default function App() {
       } else {
         setView({ stage: "actions", file: info });
       }
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error(error);
+      setView({
+        stage: "error",
+        file: buildFallbackFileInfo(paths[0]),
+        error: getErrorMessage(error),
+      });
     }
   }, []);
 
@@ -100,7 +134,7 @@ export default function App() {
           <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-success-dim ring-1 ring-white/8">
             <ShieldCheck size={12} className="text-success" />
             <span className="text-[11px] font-medium text-success tracking-wide">
-              100% Offline
+              Files Stay Local
             </span>
           </div>
         </div>
@@ -116,7 +150,18 @@ export default function App() {
               onConversionStart={(actionId) =>
                 setView({ stage: "converting", file: view.file, actionId })
               }
-              onFileRefreshed={(file) => setView({ stage: "actions", file })}
+              onFileRefreshed={(sourcePath, file) =>
+                setView((currentView) => {
+                  if (
+                    currentView.stage !== "actions" ||
+                    currentView.file.path !== sourcePath
+                  ) {
+                    return currentView;
+                  }
+
+                  return { stage: "actions", file };
+                })
+              }
               onResult={(result) =>
                 setView({ stage: "done", file: view.file, result })
               }

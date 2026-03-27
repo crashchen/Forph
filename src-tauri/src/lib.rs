@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    env,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command as StdCommand,
 };
@@ -93,29 +95,52 @@ struct ModelLookup {
 
 // ─── Helpers ─────────────────────────────────────────────
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn command_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    push_unique_path(&mut paths, PathBuf::from("/opt/homebrew/bin"));
+    push_unique_path(&mut paths, PathBuf::from("/usr/local/bin"));
+
+    if let Some(existing_path) = env::var_os("PATH") {
+        for entry in env::split_paths(&existing_path) {
+            push_unique_path(&mut paths, entry);
+        }
+    }
+
+    paths
+}
+
+fn augmented_path() -> Option<OsString> {
+    env::join_paths(command_search_paths()).ok()
+}
+
+fn command_with_augmented_path(program: impl AsRef<std::ffi::OsStr>) -> StdCommand {
+    let mut command = StdCommand::new(program);
+    if let Some(path) = augmented_path() {
+        command.env("PATH", path);
+    }
+    command
+}
+
 fn resolve_command_path(cmd: &str) -> Option<PathBuf> {
     let cmd_path = PathBuf::from(cmd);
     if cmd_path.is_absolute() && cmd_path.exists() {
         return Some(cmd_path);
     }
 
-    let from_path = StdCommand::new("which")
-        .arg(cmd)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|stdout| stdout.trim().to_string())
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
-
-    if from_path.is_some() {
-        return from_path;
+    if cmd.contains('/') {
+        return cmd_path.exists().then_some(cmd_path);
     }
 
-    ["/opt/homebrew/bin", "/usr/local/bin"]
+    command_search_paths()
         .into_iter()
-        .map(|directory| Path::new(directory).join(cmd))
+        .map(|directory| directory.join(cmd))
         .find(|path| path.exists())
 }
 
@@ -135,14 +160,10 @@ fn ffprobe_command_path() -> Option<PathBuf> {
     resolve_command_path("ffprobe")
 }
 
-fn find_whisper_command() -> Option<PathBuf> {
-    if let Some(path) = resolve_command_path("whisper-cpp") {
-        Some(path)
-    } else if let Some(path) = resolve_command_path("whisper") {
-        Some(path)
-    } else {
-        None
-    }
+fn whisper_cpp_command_path() -> Option<PathBuf> {
+    ["whisper-cli", "whisper-cpp"]
+        .into_iter()
+        .find_map(resolve_command_path)
 }
 
 fn home_dir() -> PathBuf {
@@ -247,7 +268,7 @@ fn runtime_info(app: &AppHandle) -> RuntimeInfo {
         brew_available: brew_command_path().is_some(),
         ffmpeg_available: ffmpeg_command_path().is_some(),
         ffprobe_available: ffprobe_command_path().is_some(),
-        whisper_available: find_whisper_command().is_some(),
+        whisper_available: whisper_cpp_command_path().is_some(),
         available_models: lookup.available_models,
         model_directory: Some(lookup.current_directory.to_string_lossy().to_string()),
         legacy_model_directories: lookup
@@ -278,7 +299,7 @@ fn round_duration(value: f64) -> f64 {
 fn probe_media_info(path: &str) -> Option<MediaInfo> {
     let ffprobe = ffprobe_command_path()?;
 
-    let output = StdCommand::new(ffprobe)
+    let output = command_with_augmented_path(ffprobe)
         .args([
             "-v",
             "error",
@@ -558,7 +579,7 @@ fn is_probably_url(target: &str) -> bool {
 fn dependency_is_installed(package_name: &str) -> bool {
     match package_name {
         "ffmpeg" => has_command("ffmpeg"),
-        "whisper-cpp" => find_whisper_command().is_some(),
+        "whisper-cpp" => whisper_cpp_command_path().is_some(),
         _ => false,
     }
 }
@@ -641,7 +662,7 @@ async fn convert_image(
             "webp" => {
                 let tmp_png = make_output_path(&input_path, "tmp.png");
                 let tmp_str = tmp_png.to_string_lossy().to_string();
-                let r = StdCommand::new("sips")
+                let r = command_with_augmented_path("sips")
                     .args(["-s", "format", "png", &input_path, "--out", &tmp_str])
                     .output()
                     .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -663,7 +684,7 @@ async fn convert_image(
             }
             _ => return Err(format!("不支持的输出格式: {}", output_format)),
         };
-        let r = StdCommand::new("sips")
+        let r = command_with_augmented_path("sips")
             .args(["-s", "format", sips_fmt, &input_path, "--out", &out_str])
             .output()
             .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -758,7 +779,7 @@ async fn video_to_gif(
         out_str.clone(),
     ];
 
-    let r = StdCommand::new(ffmpeg)
+    let r = command_with_augmented_path(ffmpeg)
         .args(&args)
         .output()
         .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
@@ -817,7 +838,7 @@ async fn extract_audio(
         _ => return Err(format!("不支持的音频格式: {}", output_format)),
     };
 
-    let r = StdCommand::new(ffmpeg)
+    let r = command_with_augmented_path(ffmpeg)
         .args(args)
         .output()
         .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
@@ -843,8 +864,12 @@ async fn transcribe_audio(
     model_size: String,
     language: Option<String>,
 ) -> Result<ConversionResult, String> {
-    let Some(whisper_cmd) = find_whisper_command() else {
+    let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp: brew install whisper-cpp".into());
+    };
+
+    let Some(ffmpeg) = ffmpeg_command_path() else {
+        return Err("当前转写依赖 FFmpeg 预处理音频: brew install ffmpeg".into());
     };
 
     let model_lookup = inspect_models(&app, &model_size);
@@ -857,44 +882,30 @@ async fn transcribe_audio(
         ));
     };
 
-    let input_is_wav = Path::new(&input_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("wav"))
-        .unwrap_or(false);
-
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    if let Some(ffmpeg) = ffmpeg_command_path() {
-        let r = StdCommand::new(ffmpeg)
-            .args([
-                "-y",
-                "-i",
-                &input_path,
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-                &tmp_wav_str,
-            ])
-            .output()
-            .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    let r = command_with_augmented_path(ffmpeg)
+        .args([
+            "-y",
+            "-i",
+            &input_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            &tmp_wav_str,
+        ])
+        .output()
+        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
 
-        if !r.status.success() {
-            return Err("音频预处理失败".into());
-        }
-    } else if !input_is_wav {
-        return Err("需要安装 FFmpeg 来预处理音频: brew install ffmpeg".into());
+    if !r.status.success() {
+        return Err("音频预处理失败".into());
     }
 
-    let wav_input = if tmp_wav.exists() {
-        tmp_wav_str.clone()
-    } else {
-        input_path.clone()
-    };
+    let wav_input = tmp_wav_str.clone();
 
     let out = make_output_path(&input_path, "txt");
     let out_str = out.to_string_lossy().to_string();
@@ -913,7 +924,7 @@ async fn transcribe_audio(
         args.extend(["-l".into(), lang]);
     }
 
-    let r = StdCommand::new(whisper_cmd)
+    let r = command_with_augmented_path(whisper_cmd)
         .args(&args)
         .output()
         .map_err(|e| format!("whisper 调用失败: {}", e))?;
@@ -950,7 +961,7 @@ async fn install_dependency(package_name: String) -> Result<DependencyInstallRes
 
     let package_name_for_install = package_name.clone();
     let install_output = tauri::async_runtime::spawn_blocking(move || {
-        StdCommand::new(brew)
+        command_with_augmented_path(brew)
             .args(["install", package_name_for_install.as_str()])
             .output()
     })
@@ -991,7 +1002,7 @@ async fn install_dependency(package_name: String) -> Result<DependencyInstallRes
 
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
-    StdCommand::new("open")
+    command_with_augmented_path("open")
         .args(["-R", &path])
         .spawn()
         .map_err(|e| format!("无法打开 Finder: {}", e))?;
@@ -1004,7 +1015,7 @@ fn open_target(target: String, ensure_directory: Option<bool>) -> Result<(), Str
         std::fs::create_dir_all(&target).map_err(|e| format!("无法创建目录: {}", e))?;
     }
 
-    StdCommand::new("open")
+    command_with_augmented_path("open")
         .arg(&target)
         .spawn()
         .map_err(|e| format!("无法打开目标: {}", e))?;
