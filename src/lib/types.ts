@@ -5,6 +5,8 @@ export interface FileInfo {
   size: number;
   file_type: "image" | "video" | "audio" | "markdown" | "unknown";
   actions: FileAction[];
+  media?: MediaInfo | null;
+  runtime?: RuntimeInfo | null;
 }
 
 export interface FileAction {
@@ -17,6 +19,26 @@ export interface ConversionResult {
   output_path: string;
   output_size: number;
   message: string;
+}
+
+export interface MediaInfo {
+  duration_seconds?: number | null;
+  video_width?: number | null;
+  video_height?: number | null;
+  has_audio: boolean;
+  audio_sample_rate_hz?: number | null;
+}
+
+export interface RuntimeInfo {
+  ffmpeg_available: boolean;
+  ffprobe_available: boolean;
+  whisper_available: boolean;
+  available_models: string[];
+  model_directory?: string | null;
+  legacy_model_directories: string[];
+  base_model_available: boolean;
+  base_model_path?: string | null;
+  using_legacy_model_directory: boolean;
 }
 
 export type AppView =

@@ -1,6 +1,6 @@
 import { CheckCircle2, FolderOpen, FileOutput, RotateCcw } from "lucide-react";
 import type { FileInfo, ConversionResult } from "../lib/types";
-import { revealInFinder, openFile } from "../lib/commands";
+import { revealInFinder, openTarget } from "../lib/commands";
 
 interface ResultPanelProps {
   file: FileInfo;
@@ -85,7 +85,7 @@ export function ResultPanel({ file, result, onReset }: ResultPanelProps) {
         {/* Actions */}
         <div className="mt-6 flex gap-3 justify-center">
           <button
-            onClick={() => openFile(result.output_path)}
+            onClick={() => openTarget(result.output_path)}
             className="no-drag flex items-center gap-2 px-5 py-2.5 rounded-xl bg-accent/15 text-accent text-sm font-medium hover:bg-accent/25 transition-colors cursor-pointer"
           >
             <FileOutput size={15} />

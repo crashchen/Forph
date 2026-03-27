@@ -60,6 +60,12 @@ export async function revealInFinder(path: string): Promise<void> {
   return invoke("reveal_in_finder", { path });
 }
 
-export async function openFile(path: string): Promise<void> {
-  return invoke("open_file", { path });
+export async function openTarget(
+  target: string,
+  options?: { ensureDirectory?: boolean },
+): Promise<void> {
+  return invoke("open_target", {
+    target,
+    ensureDirectory: options?.ensureDirectory ?? null,
+  });
 }

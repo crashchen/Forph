@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command as StdCommand,
+};
+use tauri::{AppHandle, Manager};
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -12,6 +16,8 @@ pub struct FileInfo {
     size: u64,
     file_type: String,
     actions: Vec<FileAction>,
+    media: Option<MediaInfo>,
+    runtime: Option<RuntimeInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -21,11 +27,61 @@ pub struct FileAction {
     group: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MediaInfo {
+    duration_seconds: Option<f64>,
+    video_width: Option<u32>,
+    video_height: Option<u32>,
+    has_audio: bool,
+    audio_sample_rate_hz: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RuntimeInfo {
+    ffmpeg_available: bool,
+    ffprobe_available: bool,
+    whisper_available: bool,
+    available_models: Vec<String>,
+    model_directory: Option<String>,
+    legacy_model_directories: Vec<String>,
+    base_model_available: bool,
+    base_model_path: Option<String>,
+    using_legacy_model_directory: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ConversionResult {
     output_path: String,
     output_size: u64,
     message: String,
+}
+
+#[derive(Deserialize)]
+struct FfprobeOutput {
+    streams: Vec<FfprobeStream>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeStream {
+    codec_type: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration: Option<String>,
+    sample_rate: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
+}
+
+struct ModelLookup {
+    current_directory: PathBuf,
+    legacy_directories: Vec<PathBuf>,
+    available_models: Vec<String>,
+    requested_model_path: Option<PathBuf>,
+    requested_model_uses_legacy_directory: bool,
 }
 
 // ─── Helpers ─────────────────────────────────────────────
@@ -38,6 +94,199 @@ fn has_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn find_whisper_command() -> Option<&'static str> {
+    if has_command("whisper-cpp") {
+        Some("whisper-cpp")
+    } else if has_command("whisper") {
+        Some("whisper")
+    } else {
+        None
+    }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Users/Shared"))
+}
+
+fn application_support_dir() -> PathBuf {
+    home_dir().join("Library/Application Support")
+}
+
+fn preferred_model_directory(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| application_support_dir().join(app.config().identifier.clone()))
+        .join("models")
+}
+
+fn legacy_model_directory_candidates() -> Vec<PathBuf> {
+    vec![
+        application_support_dir().join("Forph/models"),
+        application_support_dir().join("com.forph.app/models"),
+    ]
+}
+
+fn homebrew_model_directory_candidates() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/opt/homebrew/share/whisper-cpp/models"),
+        PathBuf::from("/usr/local/share/whisper-cpp/models"),
+    ]
+}
+
+fn parse_model_name(file_name: &str) -> Option<String> {
+    file_name
+        .strip_prefix("ggml-")
+        .and_then(|name| name.strip_suffix(".bin"))
+        .map(ToOwned::to_owned)
+}
+
+fn available_models_in_directory(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| parse_model_name(&name))
+        .collect()
+}
+
+fn inspect_models(app: &AppHandle, requested_model: &str) -> ModelLookup {
+    let current_directory = preferred_model_directory(app);
+    let legacy_directories = legacy_model_directory_candidates()
+        .into_iter()
+        .filter(|dir| dir.exists())
+        .collect::<Vec<_>>();
+    let homebrew_directories = homebrew_model_directory_candidates()
+        .into_iter()
+        .filter(|dir| dir.exists())
+        .collect::<Vec<_>>();
+
+    let mut available_models = BTreeSet::new();
+    for dir in std::iter::once(current_directory.clone())
+        .chain(legacy_directories.iter().cloned())
+        .chain(homebrew_directories.iter().cloned())
+        .filter(|dir| dir.exists())
+    {
+        for model in available_models_in_directory(&dir) {
+            available_models.insert(model);
+        }
+    }
+
+    let requested_model_file = format!("ggml-{}.bin", requested_model);
+    let search_directories = std::iter::once(current_directory.clone())
+        .chain(legacy_model_directory_candidates())
+        .chain(homebrew_model_directory_candidates());
+
+    let requested_model_path = search_directories
+        .map(|dir| dir.join(&requested_model_file))
+        .find(|path| path.exists());
+
+    let requested_model_uses_legacy_directory = requested_model_path
+        .as_ref()
+        .map(|path| legacy_directories.iter().any(|dir| path.starts_with(dir)))
+        .unwrap_or(false);
+
+    ModelLookup {
+        current_directory,
+        legacy_directories,
+        available_models: available_models.into_iter().collect(),
+        requested_model_path,
+        requested_model_uses_legacy_directory,
+    }
+}
+
+fn runtime_info(app: &AppHandle) -> RuntimeInfo {
+    let lookup = inspect_models(app, "base");
+
+    RuntimeInfo {
+        ffmpeg_available: has_command("ffmpeg"),
+        ffprobe_available: has_command("ffprobe"),
+        whisper_available: find_whisper_command().is_some(),
+        available_models: lookup.available_models,
+        model_directory: Some(lookup.current_directory.to_string_lossy().to_string()),
+        legacy_model_directories: lookup
+            .legacy_directories
+            .iter()
+            .map(|dir| dir.to_string_lossy().to_string())
+            .collect(),
+        base_model_available: lookup.requested_model_path.is_some(),
+        base_model_path: lookup
+            .requested_model_path
+            .map(|path| path.to_string_lossy().to_string()),
+        using_legacy_model_directory: lookup.requested_model_uses_legacy_directory,
+    }
+}
+
+fn parse_optional_f64(value: Option<&str>) -> Option<f64> {
+    value.and_then(|v| v.parse::<f64>().ok())
+}
+
+fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
+    value.and_then(|v| v.parse::<u32>().ok())
+}
+
+fn round_duration(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn probe_media_info(path: &str) -> Option<MediaInfo> {
+    if !has_command("ffprobe") {
+        return None;
+    }
+
+    let output = StdCommand::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            path,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let probe: FfprobeOutput = serde_json::from_slice(&output.stdout).ok()?;
+    let video_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let audio_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+
+    let duration_seconds = probe
+        .format
+        .as_ref()
+        .and_then(|format| parse_optional_f64(format.duration.as_deref()))
+        .or_else(|| video_stream.and_then(|stream| parse_optional_f64(stream.duration.as_deref())))
+        .or_else(|| audio_stream.and_then(|stream| parse_optional_f64(stream.duration.as_deref())))
+        .map(round_duration);
+
+    if duration_seconds.is_none() && video_stream.is_none() && audio_stream.is_none() {
+        return None;
+    }
+
+    Some(MediaInfo {
+        duration_seconds,
+        video_width: video_stream.and_then(|stream| stream.width),
+        video_height: video_stream.and_then(|stream| stream.height),
+        has_audio: audio_stream.is_some(),
+        audio_sample_rate_hz: audio_stream
+            .and_then(|stream| parse_optional_u32(stream.sample_rate.as_deref())),
+    })
+}
+
 fn make_output_path(input: &str, new_ext: &str) -> PathBuf {
     let p = Path::new(input);
     let stem = p.file_stem().unwrap_or_default().to_string_lossy();
@@ -47,7 +296,7 @@ fn make_output_path(input: &str, new_ext: &str) -> PathBuf {
     if !candidate.exists() {
         return candidate;
     }
-    // Avoid overwriting: append _1, _2, etc.
+
     for i in 1..1000 {
         let path = parent.join(format!("{}_{}.{}", stem, i, new_ext));
         if !path.exists() {
@@ -91,6 +340,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
             FileAction {
                 id: "vid_mp3".into(),
                 label: "提取音频 (MP3)".into(),
+                group: "音频处理".into(),
+            },
+            FileAction {
+                id: "vid_wav".into(),
+                label: "提取音频 (WAV)".into(),
                 group: "音频处理".into(),
             },
             FileAction {
@@ -189,7 +443,6 @@ fn is_frontmatter_delimiter(line: &str) -> bool {
     line.strip_suffix('\r').unwrap_or(line) == "---"
 }
 
-/// Strip YAML frontmatter only when the file begins with a standalone `---` block.
 fn strip_frontmatter(content: &str) -> &str {
     let Some(mut cursor) = opening_frontmatter_end(content) else {
         return content;
@@ -240,10 +493,32 @@ fn build_markdown_document(title: &str, html_body: &str) -> String {
     )
 }
 
+fn clamp_gif_window(
+    start_time: Option<f64>,
+    duration: Option<f64>,
+    total_duration: Option<f64>,
+) -> (f64, f64) {
+    let mut start = start_time.unwrap_or(0.0).max(0.0);
+    let mut clip_duration = duration.unwrap_or(5.0).clamp(1.0, 10.0);
+
+    if let Some(total) = total_duration.filter(|value| *value > 0.0) {
+        let max_start = (total - 0.5).max(0.0);
+        start = start.min(max_start);
+        let remaining = (total - start).max(0.2);
+        clip_duration = clip_duration.min(remaining);
+    }
+
+    (start, clip_duration)
+}
+
+fn is_probably_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
 // ─── Commands ────────────────────────────────────────────
 
 #[tauri::command]
-fn get_file_info(path: String) -> Result<FileInfo, String> {
+fn get_file_info(app: AppHandle, path: String) -> Result<FileInfo, String> {
     let p = Path::new(&path);
     let ext = p
         .extension()
@@ -268,6 +543,14 @@ fn get_file_info(path: String) -> Result<FileInfo, String> {
     .to_string();
 
     let actions = build_actions(&ext, &file_type);
+    let media = match file_type.as_str() {
+        "video" | "audio" => probe_media_info(&path),
+        _ => None,
+    };
+    let runtime = match file_type.as_str() {
+        "video" | "audio" => Some(runtime_info(&app)),
+        _ => None,
+    };
 
     Ok(FileInfo {
         name,
@@ -276,6 +559,8 @@ fn get_file_info(path: String) -> Result<FileInfo, String> {
         size: metadata.len(),
         file_type,
         actions,
+        media,
+        runtime,
     })
 }
 
@@ -294,12 +579,10 @@ async fn convert_image(
     let out_str = out.to_string_lossy().to_string();
 
     if ext == "heic" || ext == "heif" {
-        // Use macOS native sips for HEIC
         let sips_fmt = match output_format.as_str() {
             "jpg" | "jpeg" => "jpeg",
             "png" => "png",
             "webp" => {
-                // sips can't do webp, convert to png first then use image crate
                 let tmp_png = make_output_path(&input_path, "tmp.png");
                 let tmp_str = tmp_png.to_string_lossy().to_string();
                 let r = StdCommand::new("sips")
@@ -388,6 +671,13 @@ async fn video_to_gif(
         return Err("需要安装 FFmpeg: brew install ffmpeg".into());
     }
 
+    let media = probe_media_info(&input_path);
+    let (start, clip_duration) = clamp_gif_window(
+        start_time,
+        duration,
+        media.as_ref().and_then(|info| info.duration_seconds),
+    );
+
     let out = make_output_path(&input_path, "gif");
     let out_str = out.to_string_lossy().to_string();
 
@@ -397,16 +687,12 @@ async fn video_to_gif(
         format!("fps={}", fps)
     };
 
-    let mut args: Vec<String> = vec!["-y".into()];
-
-    if let Some(ss) = start_time {
-        args.extend(["-ss".into(), format!("{:.2}", ss)]);
-    }
-    if let Some(t) = duration {
-        args.extend(["-t".into(), format!("{:.2}", t)]);
-    }
-
-    args.extend([
+    let args = vec![
+        "-y".into(),
+        "-ss".into(),
+        format!("{:.2}", start),
+        "-t".into(),
+        format!("{:.2}", clip_duration),
         "-i".into(),
         input_path.clone(),
         "-vf".into(),
@@ -414,7 +700,7 @@ async fn video_to_gif(
         "-loop".into(),
         "0".into(),
         out_str.clone(),
-    ]);
+    ];
 
     let r = StdCommand::new("ffmpeg")
         .args(&args)
@@ -431,7 +717,11 @@ async fn video_to_gif(
     Ok(ConversionResult {
         output_path: out_str,
         output_size: file_size(&out),
-        message: "GIF 转换完成".into(),
+        message: format!(
+            "GIF 转换完成（{:.1}s - {:.1}s）",
+            start,
+            start + clip_duration
+        ),
     })
 }
 
@@ -447,25 +737,32 @@ async fn extract_audio(
     let out = make_output_path(&input_path, &output_format);
     let out_str = out.to_string_lossy().to_string();
 
-    let codec = match output_format.as_str() {
-        "mp3" => "libmp3lame",
-        "wav" => "pcm_s16le",
-        "aac" | "m4a" => "aac",
-        _ => return Err(format!("不支持的音频格式: {}", output_format)),
-    };
-
-    let r = StdCommand::new("ffmpeg")
-        .args([
+    let args: Vec<&str> = match output_format.as_str() {
+        "mp3" => vec![
             "-y",
             "-i",
             &input_path,
             "-vn",
             "-acodec",
-            codec,
+            "libmp3lame",
             "-q:a",
             "2",
             &out_str,
-        ])
+        ],
+        "wav" => vec![
+            "-y",
+            "-i",
+            &input_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            &out_str,
+        ],
+        _ => return Err(format!("不支持的音频格式: {}", output_format)),
+    };
+
+    let r = StdCommand::new("ffmpeg")
+        .args(args)
         .output()
         .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
 
@@ -485,46 +782,31 @@ async fn extract_audio(
 
 #[tauri::command]
 async fn transcribe_audio(
+    app: AppHandle,
     input_path: String,
     model_size: String,
     language: Option<String>,
 ) -> Result<ConversionResult, String> {
-    // Check for whisper binary
-    let whisper_cmd = if has_command("whisper-cpp") {
-        "whisper-cpp"
-    } else if has_command("whisper") {
-        "whisper"
-    } else {
+    let Some(whisper_cmd) = find_whisper_command() else {
         return Err("需要安装 whisper-cpp: brew install whisper-cpp".into());
     };
 
-    // Determine model path (Homebrew installs models to a standard location)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let model_name = format!("ggml-{}.bin", model_size);
+    let model_lookup = inspect_models(&app, &model_size);
+    let Some(model_path) = model_lookup.requested_model_path else {
+        return Err(format!(
+            "未找到 Whisper 模型 ({})。请下载对应的 ggml-{}.bin，并放到 {}。",
+            model_size,
+            model_size,
+            model_lookup.current_directory.to_string_lossy()
+        ));
+    };
 
-    // Common model locations
-    let model_paths = vec![
-        format!(
-            "{}/Library/Application Support/Forph/models/{}",
-            home, model_name
-        ),
-        format!("/opt/homebrew/share/whisper-cpp/models/{}", model_name),
-        format!("/usr/local/share/whisper-cpp/models/{}", model_name),
-    ];
+    let input_is_wav = Path::new(&input_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
 
-    let model_path = model_paths
-        .iter()
-        .find(|p| Path::new(p).exists())
-        .ok_or_else(|| {
-            format!(
-                "未找到 Whisper 模型 ({})。请运行:\n\
-                 brew install whisper-cpp\n\
-                 或手动下载模型到 ~/Library/Application Support/Forph/models/",
-                model_size
-            )
-        })?;
-
-    // First extract audio to WAV (whisper.cpp needs WAV 16kHz)
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
@@ -548,11 +830,8 @@ async fn transcribe_audio(
         if !r.status.success() {
             return Err("音频预处理失败".into());
         }
-    } else {
-        // If no ffmpeg, try using the input directly (might work for wav files)
-        if !input_path.ends_with(".wav") {
-            return Err("需要安装 FFmpeg 来预处理音频: brew install ffmpeg".into());
-        }
+    } else if !input_is_wav {
+        return Err("需要安装 FFmpeg 来预处理音频: brew install ffmpeg".into());
     }
 
     let wav_input = if tmp_wav.exists() {
@@ -566,7 +845,7 @@ async fn transcribe_audio(
 
     let mut args = vec![
         "-m".to_string(),
-        model_path.clone(),
+        model_path.to_string_lossy().to_string(),
         "-f".into(),
         wav_input.clone(),
         "-otxt".into(),
@@ -583,7 +862,6 @@ async fn transcribe_audio(
         .output()
         .map_err(|e| format!("whisper 调用失败: {}", e))?;
 
-    // Clean up temp WAV
     let _ = std::fs::remove_file(&tmp_wav);
 
     if !r.status.success() {
@@ -607,11 +885,15 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_file(path: String) -> Result<(), String> {
+fn open_target(target: String, ensure_directory: Option<bool>) -> Result<(), String> {
+    if ensure_directory.unwrap_or(false) && !is_probably_url(&target) {
+        std::fs::create_dir_all(&target).map_err(|e| format!("无法创建目录: {}", e))?;
+    }
+
     StdCommand::new("open")
-        .arg(&path)
+        .arg(&target)
         .spawn()
-        .map_err(|e| format!("无法打开文件: {}", e))?;
+        .map_err(|e| format!("无法打开目标: {}", e))?;
     Ok(())
 }
 
@@ -629,7 +911,7 @@ pub fn run() {
             extract_audio,
             transcribe_audio,
             reveal_in_finder,
-            open_file,
+            open_target,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Forph");
@@ -637,7 +919,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_frontmatter;
+    use super::{clamp_gif_window, strip_frontmatter};
 
     #[test]
     fn keeps_markdown_without_frontmatter() {
@@ -673,5 +955,19 @@ mod tests {
     fn keeps_yaml_values_that_contain_delimiters() {
         let content = "---\ntitle: a --- b\nsummary: still yaml\n---\n# Title\n";
         assert_eq!(strip_frontmatter(content), "# Title\n");
+    }
+
+    #[test]
+    fn clamps_gif_window_into_video_bounds() {
+        let (start, duration) = clamp_gif_window(Some(10.0), Some(8.0), Some(12.0));
+        assert_eq!(start, 10.0);
+        assert_eq!(duration, 2.0);
+    }
+
+    #[test]
+    fn defaults_gif_duration_to_five_seconds() {
+        let (start, duration) = clamp_gif_window(None, None, Some(20.0));
+        assert_eq!(start, 0.0);
+        assert_eq!(duration, 5.0);
     }
 }
