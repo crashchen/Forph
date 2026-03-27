@@ -70,3 +70,14 @@ brew install ffmpeg whisper-cpp
 - Markdown 的复杂 PDF / Word 分享建议继续使用 Obsidian 自带导出或你的 Pandoc 插件。
 - 图片排版成 PDF 这类需求更适合直接交给 Word / Pages / Keynote 这类成熟工具。
 - 由于开启了 macOS private API 来做透明窗口，这个版本默认不以 Mac App Store 分发为目标。
+
+## Contributing
+
+欢迎提交 issue 和 PR。
+
+- 问题反馈：<https://github.com/crashchen/Forph/issues>
+- 开发与提交流程：见 [CONTRIBUTING.md](./CONTRIBUTING.md)
+
+## License
+
+Forph 使用 [MIT License](./LICENSE) 开源。

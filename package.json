@@ -2,6 +2,16 @@
   "name": "forph",
   "private": true,
   "version": "0.1.0",
+  "description": "Forph is a macOS local file conversion app focused on reliable offline-friendly workflows.",
+  "license": "MIT",
+  "homepage": "https://github.com/crashchen/Forph",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crashchen/Forph.git"
+  },
+  "bugs": {
+    "url": "https://github.com/crashchen/Forph/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
