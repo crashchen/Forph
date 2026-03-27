@@ -868,17 +868,9 @@ async fn transcribe_audio(
         return Err("需要安装 whisper-cpp".into());
     };
 
-    let input_ext = Path::new(&input_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let input_is_wav = input_ext == "wav";
-
-    let ffmpeg = ffmpeg_command_path();
-    if ffmpeg.is_none() && !input_is_wav {
+    let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("转写前需要 FFmpeg 预处理音频".into());
-    }
+    };
 
     let model_lookup = inspect_models(&app, &model_size);
     let Some(model_path) = model_lookup.requested_model_path else {
@@ -893,33 +885,25 @@ async fn transcribe_audio(
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    if let Some(ffmpeg) = ffmpeg {
-        let r = command_with_augmented_path(ffmpeg)
-            .args([
-                "-y",
-                "-i",
-                &input_path,
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-                &tmp_wav_str,
-            ])
-            .output()
-            .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    let r = command_with_augmented_path(ffmpeg)
+        .args([
+            "-y",
+            "-i",
+            &input_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            &tmp_wav_str,
+        ])
+        .output()
+        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
 
-        if !r.status.success() {
-            return Err("音频预处理失败".into());
-        }
+    if !r.status.success() {
+        return Err("音频预处理失败".into());
     }
-
-    let wav_input = if tmp_wav.exists() {
-        tmp_wav_str.clone()
-    } else {
-        input_path.clone()
-    };
 
     let out = make_output_path(&input_path, "txt");
     let out_str = out.to_string_lossy().to_string();
@@ -928,7 +912,7 @@ async fn transcribe_audio(
         "-m".to_string(),
         model_path.to_string_lossy().to_string(),
         "-f".into(),
-        wav_input.clone(),
+        tmp_wav_str.clone(),
         "-otxt".into(),
         "-of".into(),
         out_str.trim_end_matches(".txt").to_string(),

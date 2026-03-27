@@ -60,8 +60,7 @@ function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo |
 }
 
 function requiresFfmpegForTranscription(file: FileInfo): boolean {
-  if (file.file_type === "video") return true;
-  return file.extension.toLowerCase() !== "wav";
+  return file.file_type === "video" || file.file_type === "audio";
 }
 
 function getActionDisabledReason(file: FileInfo, action: FileAction): string | null {

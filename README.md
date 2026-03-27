@@ -46,7 +46,7 @@ npx tauri dev
 
 以下能力依赖系统工具，未安装时会在对应操作里提示或禁用对应动作：
 
-- `ffmpeg` + `ffprobe`：视频转 GIF、提取音频、媒体信息读取、非 WAV 音频的转写前处理（WAV 文件可直接交给 whisper-cpp，不需要 FFmpeg）
+- `ffmpeg` + `ffprobe`：视频转 GIF、提取音频、媒体信息读取，以及所有音视频转写前处理
 - `whisper-cpp`：本地音视频转写
 - 在 Homebrew 环境里，`whisper-cpp` 常见的实际可执行名是 `whisper-cli`
 - 如果系统里已经有 Homebrew，Forph 会在动作页直接给 `一键安装 FFmpeg` / `一键安装 whisper-cpp`

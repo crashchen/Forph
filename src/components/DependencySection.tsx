@@ -34,7 +34,7 @@ export function DependencySection({
                 先装 FFmpeg，媒体转换才会完整可用
               </p>
               <p className="text-xs text-white/42 leading-relaxed">
-                GIF、音频提取，以及大多数视频 / 音频转写前处理都依赖 FFmpeg。
+                GIF、音频提取，以及所有视频 / 音频转写前处理都依赖 FFmpeg。
               </p>
               <div className="flex flex-wrap gap-2">
                 {runtime.brew_available ? (
