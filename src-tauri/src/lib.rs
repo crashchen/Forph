@@ -662,7 +662,7 @@ async fn convert_image(
             "webp" => {
                 let tmp_png = make_output_path(&input_path, "tmp.png");
                 let tmp_str = tmp_png.to_string_lossy().to_string();
-                let r = command_with_augmented_path("sips")
+                let r = StdCommand::new("sips")
                     .args(["-s", "format", "png", &input_path, "--out", &tmp_str])
                     .output()
                     .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -684,7 +684,7 @@ async fn convert_image(
             }
             _ => return Err(format!("不支持的输出格式: {}", output_format)),
         };
-        let r = command_with_augmented_path("sips")
+        let r = StdCommand::new("sips")
             .args(["-s", "format", sips_fmt, &input_path, "--out", &out_str])
             .output()
             .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -745,7 +745,7 @@ async fn video_to_gif(
     duration: Option<f64>,
 ) -> Result<ConversionResult, String> {
     let Some(ffmpeg) = ffmpeg_command_path() else {
-        return Err("需要安装 FFmpeg: brew install ffmpeg".into());
+        return Err("需要安装 FFmpeg".into());
     };
 
     let media = probe_media_info(&input_path);
@@ -808,7 +808,7 @@ async fn extract_audio(
     output_format: String,
 ) -> Result<ConversionResult, String> {
     let Some(ffmpeg) = ffmpeg_command_path() else {
-        return Err("需要安装 FFmpeg: brew install ffmpeg".into());
+        return Err("需要安装 FFmpeg".into());
     };
 
     let out = make_output_path(&input_path, &output_format);
@@ -865,12 +865,20 @@ async fn transcribe_audio(
     language: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
-        return Err("需要安装 whisper-cpp: brew install whisper-cpp".into());
+        return Err("需要安装 whisper-cpp".into());
     };
 
-    let Some(ffmpeg) = ffmpeg_command_path() else {
-        return Err("当前转写依赖 FFmpeg 预处理音频: brew install ffmpeg".into());
-    };
+    let input_ext = Path::new(&input_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let input_is_wav = input_ext == "wav";
+
+    let ffmpeg = ffmpeg_command_path();
+    if ffmpeg.is_none() && !input_is_wav {
+        return Err("转写前需要 FFmpeg 预处理音频".into());
+    }
 
     let model_lookup = inspect_models(&app, &model_size);
     let Some(model_path) = model_lookup.requested_model_path else {
@@ -885,27 +893,33 @@ async fn transcribe_audio(
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    let r = command_with_augmented_path(ffmpeg)
-        .args([
-            "-y",
-            "-i",
-            &input_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            &tmp_wav_str,
-        ])
-        .output()
-        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    if let Some(ffmpeg) = ffmpeg {
+        let r = command_with_augmented_path(ffmpeg)
+            .args([
+                "-y",
+                "-i",
+                &input_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                &tmp_wav_str,
+            ])
+            .output()
+            .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
 
-    if !r.status.success() {
-        return Err("音频预处理失败".into());
+        if !r.status.success() {
+            return Err("音频预处理失败".into());
+        }
     }
 
-    let wav_input = tmp_wav_str.clone();
+    let wav_input = if tmp_wav.exists() {
+        tmp_wav_str.clone()
+    } else {
+        input_path.clone()
+    };
 
     let out = make_output_path(&input_path, "txt");
     let out_str = out.to_string_lossy().to_string();
@@ -1002,7 +1016,7 @@ async fn install_dependency(package_name: String) -> Result<DependencyInstallRes
 
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
-    command_with_augmented_path("open")
+    StdCommand::new("open")
         .args(["-R", &path])
         .spawn()
         .map_err(|e| format!("无法打开 Finder: {}", e))?;
@@ -1015,7 +1029,7 @@ fn open_target(target: String, ensure_directory: Option<bool>) -> Result<(), Str
         std::fs::create_dir_all(&target).map_err(|e| format!("无法创建目录: {}", e))?;
     }
 
-    command_with_augmented_path("open")
+    StdCommand::new("open")
         .arg(&target)
         .spawn()
         .map_err(|e| format!("无法打开目标: {}", e))?;

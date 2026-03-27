@@ -1037,7 +1037,6 @@ name = "forph"
 version = "0.1.0"
 dependencies = [
  "image",
- "log",
  "pulldown-cmark",
  "serde",
  "serde_json",

@@ -6,21 +6,12 @@ import { FileActions } from "./components/FileActions";
 import { Converting } from "./components/Converting";
 import { ResultPanel } from "./components/ResultPanel";
 import { getFileInfo } from "./lib/commands";
+import { getErrorMessage } from "./lib/errors";
 import type { AppView, FileInfo } from "./lib/types";
 
 const appWindow = getCurrentWindow();
 
-function getErrorMessage(error: unknown): string {
-  if (typeof error === "string") {
-    return error;
-  }
-
-  if (error instanceof Error && error.message.trim().length > 0) {
-    return error.message;
-  }
-
-  return "读取文件时出了点问题，请换一个文件重试。";
-}
+const FILE_READ_ERROR_FALLBACK = "读取文件时出了点问题，请换一个文件重试。";
 
 function buildFallbackFileInfo(path: string): FileInfo {
   const name = path.split("/").pop() || "unknown";
@@ -61,7 +52,7 @@ export default function App() {
       setView({
         stage: "error",
         file: buildFallbackFileInfo(paths[0]),
-        error: getErrorMessage(error),
+        error: getErrorMessage(error, FILE_READ_ERROR_FALLBACK),
       });
     }
   }, []);

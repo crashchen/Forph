@@ -1,17 +1,12 @@
 import { CheckCircle2, FolderOpen, FileOutput, RotateCcw } from "lucide-react";
 import type { FileInfo, ConversionResult } from "../lib/types";
 import { revealInFinder, openTarget } from "../lib/commands";
+import { formatSize } from "../lib/format";
 
 interface ResultPanelProps {
   file: FileInfo;
   result: ConversionResult;
   onReset: () => void;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function shortenPath(path: string): string {
