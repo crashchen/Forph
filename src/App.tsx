@@ -67,7 +67,7 @@ export default function App() {
       try {
         await appWindow.startDragging();
       } catch (error) {
-        console.debug("Window drag start skipped", error);
+        console.error("Window dragging failed", error);
       }
     },
     [],
@@ -79,15 +79,16 @@ export default function App() {
     <div className="bg-mesh h-full p-4">
       <div className="window-frame h-full flex flex-col overflow-hidden">
         <div
-          data-tauri-drag-region
           className="drag-surface flex items-center justify-between px-5 py-4 shrink-0"
-          onMouseDown={handleWindowDrag}
+          onMouseDownCapture={(event) => {
+            void handleWindowDrag(event);
+          }}
         >
-          <div data-tauri-drag-region className="flex items-center gap-3">
+          <div className="flex items-center gap-3">
             <div className="brand-mark">
               <Zap size={16} className="text-accent" />
             </div>
-            <div data-tauri-drag-region className="space-y-0.5">
+            <div className="space-y-0.5">
               <span className="block text-sm font-semibold tracking-[0.28em] text-white/78 uppercase">
                 Forph
               </span>
@@ -96,10 +97,7 @@ export default function App() {
               </span>
             </div>
           </div>
-          <div
-            data-tauri-drag-region
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-success-dim ring-1 ring-white/8"
-          >
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-success-dim ring-1 ring-white/8">
             <ShieldCheck size={12} className="text-success" />
             <span className="text-[11px] font-medium text-success tracking-wide">
               100% Offline

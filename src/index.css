@@ -29,18 +29,11 @@ html, body, #root {
 }
 
 .drag-surface {
-  -webkit-app-region: drag;
-  app-region: drag;
   cursor: grab;
 }
 
 .drag-surface:active {
   cursor: grabbing;
-}
-
-.no-drag {
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
 }
 
 /* Subtle animated gradient background */
