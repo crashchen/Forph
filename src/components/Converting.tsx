@@ -17,10 +17,12 @@ const actionLabels: Record<string, string> = {
   vid_wav: "提取音频 (WAV)",
   vid_transcribe: "转写文字",
   vid_transcribe_srt: "转写字幕 (SRT)",
+  vid_transcribe_vtt: "转写字幕 (VTT)",
   aud_mp3: "转换为 MP3",
   aud_wav: "转换为 WAV",
   aud_transcribe: "转写文字",
   aud_transcribe_srt: "转写字幕 (SRT)",
+  aud_transcribe_vtt: "转写字幕 (VTT)",
 };
 
 export function Converting({ file, actionId }: ConvertingProps) {

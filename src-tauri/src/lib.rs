@@ -423,6 +423,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
                 label: "转写字幕 (SRT)".into(),
                 group: "AI 转写".into(),
             },
+            FileAction {
+                id: "vid_transcribe_vtt".into(),
+                label: "转写字幕 (VTT)".into(),
+                group: "AI 转写".into(),
+            },
         ],
         "audio" => vec![
             FileAction {
@@ -443,6 +448,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
             FileAction {
                 id: "aud_transcribe_srt".into(),
                 label: "转写字幕 (SRT)".into(),
+                group: "AI 转写".into(),
+            },
+            FileAction {
+                id: "aud_transcribe_vtt".into(),
+                label: "转写字幕 (VTT)".into(),
                 group: "AI 转写".into(),
             },
         ],
@@ -587,6 +597,35 @@ fn clamp_gif_window(
     (start, clip_duration)
 }
 
+fn save_image_with_quality(
+    img: &image::DynamicImage,
+    path: &Path,
+    format: &str,
+    quality: Option<u8>,
+) -> Result<(), String> {
+    match format {
+        "jpg" | "jpeg" => {
+            let file =
+                std::fs::File::create(path).map_err(|e| format!("创建文件失败: {}", e))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let q = quality.unwrap_or(85);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, q);
+            img.write_with_encoder(encoder)
+                .map_err(|e| format!("保存 JPEG 失败: {}", e))?;
+        }
+        "png" => {
+            img.save_with_format(path, image::ImageFormat::Png)
+                .map_err(|e| format!("保存 PNG 失败: {}", e))?;
+        }
+        "webp" => {
+            img.save_with_format(path, image::ImageFormat::WebP)
+                .map_err(|e| format!("保存 WebP 失败: {}", e))?;
+        }
+        _ => return Err(format!("不支持的输出格式: {}", format)),
+    }
+    Ok(())
+}
+
 fn is_probably_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
@@ -675,6 +714,7 @@ fn get_file_info(app: AppHandle, path: String) -> Result<FileInfo, String> {
 async fn convert_image(
     input_path: String,
     output_format: String,
+    quality: Option<u8>,
 ) -> Result<ConversionResult, String> {
     let ext = Path::new(&input_path)
         .extension()
@@ -686,9 +726,42 @@ async fn convert_image(
     let out_str = out.to_string_lossy().to_string();
 
     if ext == "heic" || ext == "heif" {
-        let sips_fmt = match output_format.as_str() {
-            "jpg" | "jpeg" => "jpeg",
-            "png" => "png",
+        match output_format.as_str() {
+            "jpg" | "jpeg" => {
+                let q_str = quality.unwrap_or(85).to_string();
+                let r = StdCommand::new("sips")
+                    .args([
+                        "-s",
+                        "format",
+                        "jpeg",
+                        "-s",
+                        "formatOptions",
+                        &q_str,
+                        &input_path,
+                        "--out",
+                        &out_str,
+                    ])
+                    .output()
+                    .map_err(|e| format!("sips 调用失败: {}", e))?;
+                if !r.status.success() {
+                    return Err(format!(
+                        "HEIC 转换失败: {}",
+                        String::from_utf8_lossy(&r.stderr)
+                    ));
+                }
+            }
+            "png" => {
+                let r = StdCommand::new("sips")
+                    .args(["-s", "format", "png", &input_path, "--out", &out_str])
+                    .output()
+                    .map_err(|e| format!("sips 调用失败: {}", e))?;
+                if !r.status.success() {
+                    return Err(format!(
+                        "HEIC 转换失败: {}",
+                        String::from_utf8_lossy(&r.stderr)
+                    ));
+                }
+            }
             "webp" => {
                 let tmp_png = make_output_path(&input_path, "tmp.png");
                 let tmp_str = tmp_png.to_string_lossy().to_string();
@@ -702,38 +775,16 @@ async fn convert_image(
                         String::from_utf8_lossy(&r.stderr)
                     ));
                 }
-                let img = image::open(&tmp_png).map_err(|e| format!("读取临时 PNG 失败: {}", e))?;
-                img.save_with_format(&out, image::ImageFormat::WebP)
-                    .map_err(|e| format!("保存 WebP 失败: {}", e))?;
+                let img =
+                    image::open(&tmp_png).map_err(|e| format!("读取临时 PNG 失败: {}", e))?;
+                save_image_with_quality(&img, &out, "webp", quality)?;
                 let _ = std::fs::remove_file(&tmp_png);
-                return Ok(ConversionResult {
-                    output_path: out_str,
-                    output_size: file_size(&out),
-                    message: "转换完成".into(),
-                });
             }
             _ => return Err(format!("不支持的输出格式: {}", output_format)),
-        };
-        let r = StdCommand::new("sips")
-            .args(["-s", "format", sips_fmt, &input_path, "--out", &out_str])
-            .output()
-            .map_err(|e| format!("sips 调用失败: {}", e))?;
-        if !r.status.success() {
-            return Err(format!(
-                "HEIC 转换失败: {}",
-                String::from_utf8_lossy(&r.stderr)
-            ));
         }
     } else {
         let img = image::open(&input_path).map_err(|e| format!("无法读取图片: {}", e))?;
-        let fmt = match output_format.as_str() {
-            "jpg" | "jpeg" => image::ImageFormat::Jpeg,
-            "png" => image::ImageFormat::Png,
-            "webp" => image::ImageFormat::WebP,
-            _ => return Err(format!("不支持的输出格式: {}", output_format)),
-        };
-        img.save_with_format(&out, fmt)
-            .map_err(|e| format!("保存失败: {}", e))?;
+        save_image_with_quality(&img, &out, &output_format, quality)?;
     }
 
     Ok(ConversionResult {

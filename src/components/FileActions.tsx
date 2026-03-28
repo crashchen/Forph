@@ -21,6 +21,7 @@ import { getErrorMessage } from "../lib/errors";
 import { getActionDisabledReason } from "../lib/actions";
 import { GifOptions } from "./GifOptions";
 import { CompressOptions } from "./CompressOptions";
+import { ImageOptions } from "./ImageOptions";
 import { DependencySection, type InstallableDependency } from "./DependencySection";
 
 interface FileActionsProps {
@@ -73,6 +74,7 @@ export function FileActions({
 }: FileActionsProps) {
   const [showGifOptions, setShowGifOptions] = useState(false);
   const [showCompressOptions, setShowCompressOptions] = useState(false);
+  const [imageOutputFormat, setImageOutputFormat] = useState<string | null>(null);
   const [installingDependency, setInstallingDependency] =
     useState<InstallableDependency | null>(null);
   const [dependencyMessage, setDependencyMessage] = useState<string | null>(null);
@@ -95,6 +97,7 @@ export function FileActions({
     installRequestIdRef.current += 1;
     setShowGifOptions(false);
     setShowCompressOptions(false);
+    setImageOutputFormat(null);
     setInstallingDependency(null);
     setDependencyMessage(null);
     setDependencyError(null);
@@ -106,10 +109,7 @@ export function FileActions({
       try {
         let result: ConversionResult;
 
-        if (action.id.startsWith("img_")) {
-          const fmt = action.id.replace("img_", "");
-          result = await convertImage(file.path, fmt);
-        } else if (action.id === "md_html") {
+        if (action.id === "md_html") {
           result = await exportMarkdown(file.path);
         } else if (action.id === "vid_mp3" || action.id === "aud_mp3") {
           result = await extractAudio(file.path, "mp3");
@@ -125,6 +125,11 @@ export function FileActions({
           action.id === "aud_transcribe_srt"
         ) {
           result = await transcribeAudio(file.path, "base", undefined, "srt");
+        } else if (
+          action.id === "vid_transcribe_vtt" ||
+          action.id === "aud_transcribe_vtt"
+        ) {
+          result = await transcribeAudio(file.path, "base", undefined, "vtt");
         } else {
           throw new Error(`未知操作: ${action.id}`);
         }
@@ -134,6 +139,21 @@ export function FileActions({
       }
     },
     [file, onConversionStart, onResult, onError],
+  );
+
+  const handleImageConvert = useCallback(
+    async (quality?: number) => {
+      if (!imageOutputFormat) return;
+      const actionId = `img_${imageOutputFormat}`;
+      onConversionStart(actionId);
+      try {
+        const result = await convertImage(file.path, imageOutputFormat, quality);
+        onResult(result);
+      } catch (error) {
+        onError(getErrorMessage(error, "图片转换失败"));
+      }
+    },
+    [file, imageOutputFormat, onConversionStart, onResult, onError],
   );
 
   const handleDependencyInstall = useCallback(
@@ -268,17 +288,28 @@ export function FileActions({
               const disabledReason = getActionDisabledReason(file, action);
               const disabled = Boolean(disabledReason);
 
-              if (action.id === "vid_gif" || action.id === "vid_compress") {
-                const togglePanel =
-                  action.id === "vid_gif"
-                    ? () => {
-                        setShowGifOptions((v) => !v);
-                        setShowCompressOptions(false);
-                      }
-                    : () => {
-                        setShowCompressOptions((v) => !v);
-                        setShowGifOptions(false);
-                      };
+              const hasOptionsPanel =
+                action.id === "vid_gif" ||
+                action.id === "vid_compress" ||
+                action.id.startsWith("img_");
+
+              if (hasOptionsPanel) {
+                const togglePanel = () => {
+                  if (action.id === "vid_gif") {
+                    setShowGifOptions((v) => !v);
+                    setShowCompressOptions(false);
+                    setImageOutputFormat(null);
+                  } else if (action.id === "vid_compress") {
+                    setShowCompressOptions((v) => !v);
+                    setShowGifOptions(false);
+                    setImageOutputFormat(null);
+                  } else {
+                    const fmt = action.id.replace("img_", "");
+                    setImageOutputFormat((v) => (v === fmt ? null : fmt));
+                    setShowGifOptions(false);
+                    setShowCompressOptions(false);
+                  }
+                };
                 return (
                   <button
                     key={action.id}
@@ -318,6 +349,12 @@ export function FileActions({
 
       {showGifOptions && <GifOptions file={file} onConvert={handleGifConvert} />}
       {showCompressOptions && <CompressOptions file={file} onCompress={handleCompress} />}
+      {imageOutputFormat && (
+        <ImageOptions
+          outputFormat={imageOutputFormat}
+          onConvert={handleImageConvert}
+        />
+      )}
 
       {runtime && (
         <DependencySection

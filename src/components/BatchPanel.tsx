@@ -36,6 +36,7 @@ import { getErrorMessage } from "../lib/errors";
 import { getActionDisabledReason } from "../lib/actions";
 import { GifOptions } from "./GifOptions";
 import { CompressOptions } from "./CompressOptions";
+import { ImageOptions } from "./ImageOptions";
 import { DependencySection, type InstallableDependency } from "./DependencySection";
 
 interface BatchPanelProps {
@@ -69,10 +70,11 @@ async function runAction(
     gifDuration?: number;
     compressQuality?: string;
     compressMaxResolution?: string;
+    imageQuality?: number;
   },
 ): Promise<ConversionResult> {
   if (actionId.startsWith("img_"))
-    return convertImage(file.path, actionId.replace("img_", ""));
+    return convertImage(file.path, actionId.replace("img_", ""), opts?.imageQuality);
   if (actionId === "md_html") return exportMarkdown(file.path);
   if (actionId === "vid_gif")
     return videoToGif(
@@ -96,6 +98,8 @@ async function runAction(
     return transcribeAudio(file.path, "base");
   if (actionId === "vid_transcribe_srt" || actionId === "aud_transcribe_srt")
     return transcribeAudio(file.path, "base", undefined, "srt");
+  if (actionId === "vid_transcribe_vtt" || actionId === "aud_transcribe_vtt")
+    return transcribeAudio(file.path, "base", undefined, "vtt");
   throw new Error(`未知操作: ${actionId}`);
 }
 
@@ -112,6 +116,7 @@ export function BatchPanel({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showGifOptions, setShowGifOptions] = useState(false);
   const [showCompressOptions, setShowCompressOptions] = useState(false);
+  const [imageOutputFormat, setImageOutputFormat] = useState<string | null>(null);
   const [installingDependency, setInstallingDependency] =
     useState<InstallableDependency | null>(null);
   const [dependencyMessage, setDependencyMessage] = useState<string | null>(
@@ -143,6 +148,7 @@ export function BatchPanel({
         gifDuration?: number;
         compressQuality?: string;
         compressMaxResolution?: string;
+        imageQuality?: number;
       },
     ) => {
       setPhase("converting");
@@ -292,20 +298,28 @@ export function BatchPanel({
                 );
                 const disabled = Boolean(disabledReason);
 
-                if (
+                const hasOptionsPanel =
                   action.id === "vid_gif" ||
-                  action.id === "vid_compress"
-                ) {
-                  const togglePanel =
-                    action.id === "vid_gif"
-                      ? () => {
-                          setShowGifOptions((v) => !v);
-                          setShowCompressOptions(false);
-                        }
-                      : () => {
-                          setShowCompressOptions((v) => !v);
-                          setShowGifOptions(false);
-                        };
+                  action.id === "vid_compress" ||
+                  action.id.startsWith("img_");
+
+                if (hasOptionsPanel) {
+                  const togglePanel = () => {
+                    if (action.id === "vid_gif") {
+                      setShowGifOptions((v) => !v);
+                      setShowCompressOptions(false);
+                      setImageOutputFormat(null);
+                    } else if (action.id === "vid_compress") {
+                      setShowCompressOptions((v) => !v);
+                      setShowGifOptions(false);
+                      setImageOutputFormat(null);
+                    } else {
+                      const fmt = action.id.replace("img_", "");
+                      setImageOutputFormat((v) => (v === fmt ? null : fmt));
+                      setShowGifOptions(false);
+                      setShowCompressOptions(false);
+                    }
+                  };
                   return (
                     <button
                       key={action.id}
@@ -363,6 +377,16 @@ export function BatchPanel({
               startBatch("vid_compress", {
                 compressQuality: quality,
                 compressMaxResolution: maxResolution,
+              })
+            }
+          />
+        )}
+        {imageOutputFormat && (
+          <ImageOptions
+            outputFormat={imageOutputFormat}
+            onConvert={(quality) =>
+              startBatch(`img_${imageOutputFormat}`, {
+                imageQuality: quality,
               })
             }
           />
@@ -439,6 +463,15 @@ export function BatchPanel({
               ))}
             </div>
           )}
+
+          <button
+            onClick={() => {
+              cancelledRef.current = true;
+            }}
+            className="no-drag mt-5 px-5 py-2 rounded-xl text-sm text-white/40 hover:text-white/60 hover:bg-white/5 transition-colors cursor-pointer"
+          >
+            停止处理
+          </button>
         </div>
       </div>
     );

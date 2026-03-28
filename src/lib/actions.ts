@@ -37,7 +37,9 @@ export function getActionDisabledReason(
     action.id === "vid_transcribe" ||
     action.id === "aud_transcribe" ||
     action.id === "vid_transcribe_srt" ||
-    action.id === "aud_transcribe_srt"
+    action.id === "aud_transcribe_srt" ||
+    action.id === "vid_transcribe_vtt" ||
+    action.id === "aud_transcribe_vtt"
   ) {
     if (!runtime.whisper_available) {
       return "需要先安装 whisper-cpp";
@@ -49,7 +51,9 @@ export function getActionDisabledReason(
       return "当前文件转写前需要 FFmpeg 预处理";
     }
     if (
-      (action.id === "vid_transcribe" || action.id === "vid_transcribe_srt") &&
+      (action.id === "vid_transcribe" ||
+        action.id === "vid_transcribe_srt" ||
+        action.id === "vid_transcribe_vtt") &&
       media?.has_audio === false
     ) {
       return "这个视频里没有可转写的音轨";

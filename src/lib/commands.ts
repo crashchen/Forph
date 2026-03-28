@@ -12,10 +12,12 @@ export async function getFileInfo(path: string): Promise<FileInfo> {
 export async function convertImage(
   inputPath: string,
   outputFormat: string,
+  quality?: number,
 ): Promise<ConversionResult> {
   return invoke("convert_image", {
     inputPath,
     outputFormat,
+    quality: quality ?? null,
   });
 }
 
