@@ -5,6 +5,7 @@ import { DropZone } from "./components/DropZone";
 import { FileActions } from "./components/FileActions";
 import { Converting } from "./components/Converting";
 import { ResultPanel } from "./components/ResultPanel";
+import { BatchPanel } from "./components/BatchPanel";
 import { getFileInfo } from "./lib/commands";
 import { getErrorMessage } from "./lib/errors";
 import type { AppView, FileInfo } from "./lib/types";
@@ -36,16 +37,60 @@ export default function App() {
 
   const handleFileDrop = useCallback(async (paths: string[]) => {
     if (paths.length === 0) return;
-    try {
-      const info = await getFileInfo(paths[0]);
-      if (info.file_type === "unknown") {
+
+    if (paths.length === 1) {
+      try {
+        const info = await getFileInfo(paths[0]);
+        if (info.file_type === "unknown") {
+          setView({
+            stage: "error",
+            file: info,
+            error: `不支持的文件格式: .${info.extension}`,
+          });
+        } else {
+          setView({ stage: "actions", file: info });
+        }
+      } catch (error) {
+        console.error(error);
         setView({
           stage: "error",
-          file: info,
-          error: `不支持的文件格式: .${info.extension}`,
+          file: buildFallbackFileInfo(paths[0]),
+          error: getErrorMessage(error, FILE_READ_ERROR_FALLBACK),
         });
+      }
+      return;
+    }
+
+    // Batch mode
+    try {
+      const infos = await Promise.all(paths.map((p) => getFileInfo(p)));
+      const supported = infos.filter((f) => f.file_type !== "unknown");
+
+      if (supported.length === 0) {
+        setView({
+          stage: "error",
+          file: buildFallbackFileInfo(paths[0]),
+          error: "所有文件格式都不支持",
+        });
+        return;
+      }
+
+      // Group by dominant type
+      const typeCounts: Record<string, number> = {};
+      for (const f of supported) {
+        typeCounts[f.file_type] = (typeCounts[f.file_type] || 0) + 1;
+      }
+      const dominantType = Object.entries(typeCounts).sort(
+        (a, b) => b[1] - a[1],
+      )[0][0];
+      const batchFiles = supported.filter(
+        (f) => f.file_type === dominantType,
+      );
+
+      if (batchFiles.length === 1) {
+        setView({ stage: "actions", file: batchFiles[0] });
       } else {
-        setView({ stage: "actions", file: info });
+        setView({ stage: "batch", files: batchFiles });
       }
     } catch (error) {
       console.error(error);
@@ -169,6 +214,18 @@ export default function App() {
             <ResultPanel
               file={view.file}
               result={view.result}
+              onReset={reset}
+            />
+          )}
+          {view.stage === "batch" && (
+            <BatchPanel
+              files={view.files}
+              isDragOver={isDragOver}
+              onFilesRefreshed={(files) =>
+                setView((v) =>
+                  v.stage === "batch" ? { stage: "batch", files } : v,
+                )
+              }
               onReset={reset}
             />
           )}

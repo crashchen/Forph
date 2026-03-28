@@ -47,9 +47,16 @@ export interface DependencyInstallResult {
   message: string;
 }
 
+export interface BatchFileResult {
+  file: FileInfo;
+  result?: ConversionResult;
+  error?: string;
+}
+
 export type AppView =
   | { stage: "idle" }
   | { stage: "actions"; file: FileInfo }
   | { stage: "converting"; file: FileInfo; actionId: string }
   | { stage: "done"; file: FileInfo; result: ConversionResult }
-  | { stage: "error"; file: FileInfo; error: string };
+  | { stage: "error"; file: FileInfo; error: string }
+  | { stage: "batch"; files: FileInfo[] };

@@ -9,7 +9,7 @@ interface DropZoneProps {
 export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
   const handleBrowse = async () => {
     const selected = await open({
-      multiple: false,
+      multiple: true,
       filters: [
         {
           name: "Supported Files",
@@ -24,6 +24,8 @@ export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
     });
     if (typeof selected === "string") {
       onFileDrop([selected]);
+    } else if (Array.isArray(selected) && selected.length > 0) {
+      onFileDrop(selected);
     }
   };
 

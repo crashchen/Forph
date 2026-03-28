@@ -12,12 +12,15 @@ const actionLabels: Record<string, string> = {
   img_webp: "转换为 WebP",
   md_html: "导出 HTML",
   vid_gif: "转换为 GIF",
+  vid_compress: "压缩视频",
   vid_mp3: "提取音频 (MP3)",
   vid_wav: "提取音频 (WAV)",
   vid_transcribe: "转写文字",
+  vid_transcribe_srt: "转写字幕 (SRT)",
   aud_mp3: "转换为 MP3",
   aud_wav: "转换为 WAV",
   aud_transcribe: "转写文字",
+  aud_transcribe_srt: "转写字幕 (SRT)",
 };
 
 export function Converting({ file, actionId }: ConvertingProps) {
