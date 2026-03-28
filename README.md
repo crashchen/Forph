@@ -1,13 +1,14 @@
 # Forph
 
-Forph 是一个 macOS 本地文件转换器，主打拖拽即处理、文件本地处理和轻量分发。当前版本把稳定高频的媒体处理链路打磨成第一优先级：短视频转 GIF、提取音频，以及本地离线转写。
+Forph 是一个 macOS 本地文件转换器，主打拖拽即处理、文件本地处理和轻量分发。当前版本把稳定高频的媒体处理链路打磨成第一优先级：视频压缩、转 GIF、提取音频、本地离线转写与字幕生成。
 
 ## Current Features
 
 - 图片转换：输入支持 `JPG / PNG / WEBP / HEIC / HEIF / BMP / TIFF`，输出支持 `JPG / PNG / WEBP`
 - Markdown 导出：`HTML`
-- 视频处理：转 GIF、提取音频（MP3 / WAV）、离线转写
-- 音频处理：转 MP3 / WAV、离线转写
+- 视频处理：压缩视频（H.264，可选画质和最大分辨率）、转 GIF、提取音频（MP3 / WAV）、离线转写、转写字幕（SRT）
+- 音频处理：转 MP3 / WAV、离线转写、转写字幕（SRT）
+- 结果拖出：转换完成后，可将文件卡片直接拖到微信、邮件等其他应用
 
 ## Platform Scope
 
@@ -46,7 +47,7 @@ npx tauri dev
 
 以下能力依赖系统工具，未安装时会在对应操作里提示或禁用对应动作：
 
-- `ffmpeg` + `ffprobe`：视频转 GIF、提取音频、媒体信息读取，以及所有音视频转写前处理
+- `ffmpeg` + `ffprobe`：视频压缩、转 GIF、提取音频、媒体信息读取，以及所有音视频转写前处理
 - `whisper-cpp`：本地音视频转写
 - 在 Homebrew 环境里，`whisper-cpp` 常见的实际可执行名是 `whisper-cli`
 - 如果系统里已经有 Homebrew，Forph 会在动作页直接给 `一键安装 FFmpeg` / `一键安装 whisper-cpp`
@@ -60,8 +61,11 @@ brew install ffmpeg whisper-cpp
 
 ## Notes
 
+- 视频压缩使用 H.264 + AAC 编码（`.mp4`），提供高画质 / 均衡 / 小体积 / 极限压缩四档画质，可选限制最大分辨率到 1080p / 720p / 480p。
 - GIF 更适合短视频片段。应用会对大于 15 秒、超过 50MB 或高于 1080p 的视频给出醒目提示，但不会强拦截。
 - GIF 面板支持自定义开始时间和持续时长，更适合从视频中间截一小段出来做动图。
+- 转写支持输出纯文本（`.txt`）和 SRT 字幕（`.srt`），字幕格式带有时间戳，可直接用于视频编辑。
+- 转换完成后，结果面板的文件卡片支持直接拖拽到 Finder、微信、邮件等其他应用。
 - 文件转换和转写都在本机完成，但首次安装依赖、下载模型这些恢复路径仍然需要联网。
 - Whisper 默认使用 `ggml-base.bin`。如果缺模型，界面里会直接给“下载模型”和“打开模型文件夹”的入口。
 - 当前主模型目录会跟随 bundle identifier 走到应用数据目录，也就是类似 `~/Library/Application Support/com.crashchen.forph/models/`。

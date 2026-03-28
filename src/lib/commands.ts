@@ -48,15 +48,29 @@ export async function extractAudio(
   return invoke("extract_audio", { inputPath, outputFormat });
 }
 
+export async function compressVideo(
+  inputPath: string,
+  quality: string,
+  maxResolution?: string,
+): Promise<ConversionResult> {
+  return invoke("compress_video", {
+    inputPath,
+    quality,
+    maxResolution: maxResolution ?? null,
+  });
+}
+
 export async function transcribeAudio(
   inputPath: string,
   modelSize: string,
   language?: string,
+  outputFormat?: string,
 ): Promise<ConversionResult> {
   return invoke("transcribe_audio", {
     inputPath,
     modelSize,
     language: language ?? null,
+    outputFormat: outputFormat ?? null,
   });
 }
 
@@ -64,6 +78,10 @@ export async function installDependency(
   packageName: "ffmpeg" | "whisper-cpp",
 ): Promise<DependencyInstallResult> {
   return invoke("install_dependency", { packageName });
+}
+
+export async function getDragIcon(): Promise<string> {
+  return invoke("get_drag_icon");
 }
 
 export async function revealInFinder(path: string): Promise<void> {

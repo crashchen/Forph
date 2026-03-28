@@ -7,6 +7,7 @@ import type {
   MediaInfo,
 } from "../lib/types";
 import {
+  compressVideo,
   convertImage,
   exportMarkdown,
   extractAudio,
@@ -15,10 +16,10 @@ import {
   transcribeAudio,
   videoToGif,
 } from "../lib/commands";
-import { formatSize } from "../lib/format";
-import { formatDuration } from "../lib/format";
+import { formatSize, formatDuration } from "../lib/format";
 import { getErrorMessage } from "../lib/errors";
 import { GifOptions } from "./GifOptions";
+import { CompressOptions } from "./CompressOptions";
 import { DependencySection, type InstallableDependency } from "./DependencySection";
 
 interface FileActionsProps {
@@ -71,7 +72,7 @@ function getActionDisabledReason(file: FileInfo, action: FileAction): string | n
     return null;
   }
 
-  if (action.id === "vid_gif") {
+  if (action.id === "vid_gif" || action.id === "vid_compress") {
     return runtime.ffmpeg_available ? null : "需要先安装 FFmpeg";
   }
 
@@ -89,7 +90,12 @@ function getActionDisabledReason(file: FileInfo, action: FileAction): string | n
     return runtime.ffmpeg_available ? null : "需要先安装 FFmpeg";
   }
 
-  if (action.id === "vid_transcribe" || action.id === "aud_transcribe") {
+  if (
+    action.id === "vid_transcribe" ||
+    action.id === "aud_transcribe" ||
+    action.id === "vid_transcribe_srt" ||
+    action.id === "aud_transcribe_srt"
+  ) {
     if (!runtime.whisper_available) {
       return "需要先安装 whisper-cpp";
     }
@@ -99,7 +105,10 @@ function getActionDisabledReason(file: FileInfo, action: FileAction): string | n
     if (requiresFfmpegForTranscription(file) && !runtime.ffmpeg_available) {
       return "当前文件转写前需要 FFmpeg 预处理";
     }
-    if (action.id === "vid_transcribe" && media?.has_audio === false) {
+    if (
+      (action.id === "vid_transcribe" || action.id === "vid_transcribe_srt") &&
+      media?.has_audio === false
+    ) {
       return "这个视频里没有可转写的音轨";
     }
     return null;
@@ -118,6 +127,7 @@ export function FileActions({
   onReset,
 }: FileActionsProps) {
   const [showGifOptions, setShowGifOptions] = useState(false);
+  const [showCompressOptions, setShowCompressOptions] = useState(false);
   const [installingDependency, setInstallingDependency] =
     useState<InstallableDependency | null>(null);
   const [dependencyMessage, setDependencyMessage] = useState<string | null>(null);
@@ -139,6 +149,7 @@ export function FileActions({
     activeFilePathRef.current = file.path;
     installRequestIdRef.current += 1;
     setShowGifOptions(false);
+    setShowCompressOptions(false);
     setInstallingDependency(null);
     setDependencyMessage(null);
     setDependencyError(null);
@@ -164,6 +175,11 @@ export function FileActions({
           action.id === "aud_transcribe"
         ) {
           result = await transcribeAudio(file.path, "base");
+        } else if (
+          action.id === "vid_transcribe_srt" ||
+          action.id === "aud_transcribe_srt"
+        ) {
+          result = await transcribeAudio(file.path, "base", undefined, "srt");
         } else {
           throw new Error(`未知操作: ${action.id}`);
         }
@@ -226,6 +242,19 @@ export function FileActions({
       }
     },
     [file.path, onFileRefreshed],
+  );
+
+  const handleCompress = useCallback(
+    async (quality: string, maxResolution?: string) => {
+      onConversionStart("vid_compress");
+      try {
+        const result = await compressVideo(file.path, quality, maxResolution);
+        onResult(result);
+      } catch (error) {
+        onError(getErrorMessage(error, "视频压缩失败"));
+      }
+    },
+    [file, onConversionStart, onResult, onError],
   );
 
   const handleGifConvert = useCallback(
@@ -294,13 +323,23 @@ export function FileActions({
               const disabledReason = getActionDisabledReason(file, action);
               const disabled = Boolean(disabledReason);
 
-              if (action.id === "vid_gif") {
+              if (action.id === "vid_gif" || action.id === "vid_compress") {
+                const togglePanel =
+                  action.id === "vid_gif"
+                    ? () => {
+                        setShowGifOptions((v) => !v);
+                        setShowCompressOptions(false);
+                      }
+                    : () => {
+                        setShowCompressOptions((v) => !v);
+                        setShowGifOptions(false);
+                      };
                 return (
                   <button
                     key={action.id}
                     title={disabledReason ?? action.label}
                     disabled={disabled}
-                    onClick={() => setShowGifOptions((value) => !value)}
+                    onClick={togglePanel}
                     className={`no-drag glass glass-hover px-4 py-3 rounded-xl text-sm font-medium transition-all ${
                       disabled
                         ? "cursor-not-allowed text-white/28 border-white/6 hover:bg-transparent"
@@ -333,6 +372,7 @@ export function FileActions({
       ))}
 
       {showGifOptions && <GifOptions file={file} onConvert={handleGifConvert} />}
+      {showCompressOptions && <CompressOptions file={file} onCompress={handleCompress} />}
 
       {runtime && (
         <DependencySection

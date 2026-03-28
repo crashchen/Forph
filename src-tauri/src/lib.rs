@@ -399,6 +399,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
                 group: "视频处理".into(),
             },
             FileAction {
+                id: "vid_compress".into(),
+                label: "压缩视频".into(),
+                group: "视频处理".into(),
+            },
+            FileAction {
                 id: "vid_mp3".into(),
                 label: "提取音频 (MP3)".into(),
                 group: "音频处理".into(),
@@ -411,6 +416,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
             FileAction {
                 id: "vid_transcribe".into(),
                 label: "转写文字".into(),
+                group: "AI 转写".into(),
+            },
+            FileAction {
+                id: "vid_transcribe_srt".into(),
+                label: "转写字幕 (SRT)".into(),
                 group: "AI 转写".into(),
             },
         ],
@@ -428,6 +438,11 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
             FileAction {
                 id: "aud_transcribe".into(),
                 label: "转写文字".into(),
+                group: "AI 转写".into(),
+            },
+            FileAction {
+                id: "aud_transcribe_srt".into(),
+                label: "转写字幕 (SRT)".into(),
                 group: "AI 转写".into(),
             },
         ],
@@ -590,6 +605,21 @@ fn dependency_display_name(package_name: &str) -> Option<&'static str> {
         "whisper-cpp" => Some("whisper-cpp"),
         _ => None,
     }
+}
+
+fn ensure_drag_icon(app: &AppHandle) -> PathBuf {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let icon_path = dir.join("drag_icon.png");
+    if icon_path.exists() {
+        return icon_path;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([99, 102, 241, 180]));
+    let _ = img.save(&icon_path);
+    icon_path
 }
 
 // ─── Commands ────────────────────────────────────────────
@@ -858,11 +888,89 @@ async fn extract_audio(
 }
 
 #[tauri::command]
+async fn compress_video(
+    input_path: String,
+    quality: String,
+    max_resolution: Option<String>,
+) -> Result<ConversionResult, String> {
+    let Some(ffmpeg) = ffmpeg_command_path() else {
+        return Err("需要安装 FFmpeg".into());
+    };
+
+    let crf = match quality.as_str() {
+        "high" => "18",
+        "small" => "28",
+        "tiny" => "35",
+        _ => "23",
+    };
+
+    let out = make_output_path(&input_path, "mp4");
+    let out_str = out.to_string_lossy().to_string();
+
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        input_path.clone(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-crf".into(),
+        crf.into(),
+        "-preset".into(),
+        "medium".into(),
+    ];
+
+    if let Some(ref res) = max_resolution {
+        let max_w = match res.as_str() {
+            "1080p" => 1920,
+            "720p" => 1280,
+            "480p" => 854,
+            _ => 0,
+        };
+        if max_w > 0 {
+            args.extend([
+                "-vf".into(),
+                format!(
+                    "scale='min({},iw)':-2",
+                    max_w
+                ),
+            ]);
+        }
+    }
+
+    args.extend([
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "128k".into(),
+        out_str.clone(),
+    ]);
+
+    let r = command_with_augmented_path(ffmpeg)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+
+    if !r.status.success() {
+        return Err(format!(
+            "视频压缩失败: {}",
+            String::from_utf8_lossy(&r.stderr)
+        ));
+    }
+
+    Ok(ConversionResult {
+        output_path: out_str,
+        output_size: file_size(&out),
+        message: "视频压缩完成".into(),
+    })
+}
+
+#[tauri::command]
 async fn transcribe_audio(
     app: AppHandle,
     input_path: String,
     model_size: String,
     language: Option<String>,
+    output_format: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp".into());
@@ -905,17 +1013,28 @@ async fn transcribe_audio(
         return Err("音频预处理失败".into());
     }
 
-    let out = make_output_path(&input_path, "txt");
+    let fmt = output_format.as_deref().unwrap_or("txt");
+    let (whisper_output_flag, file_ext) = match fmt {
+        "srt" => ("-osrt", "srt"),
+        "vtt" => ("-ovtt", "vtt"),
+        _ => ("-otxt", "txt"),
+    };
+
+    let out = make_output_path(&input_path, file_ext);
     let out_str = out.to_string_lossy().to_string();
+    let of_base = out_str
+        .strip_suffix(&format!(".{}", file_ext))
+        .unwrap_or(&out_str)
+        .to_string();
 
     let mut args = vec![
         "-m".to_string(),
         model_path.to_string_lossy().to_string(),
         "-f".into(),
         tmp_wav_str.clone(),
-        "-otxt".into(),
+        whisper_output_flag.into(),
         "-of".into(),
-        out_str.trim_end_matches(".txt").to_string(),
+        of_base,
     ];
 
     if let Some(lang) = language {
@@ -936,7 +1055,12 @@ async fn transcribe_audio(
     Ok(ConversionResult {
         output_path: out_str,
         output_size: file_size(&out),
-        message: "转写完成".into(),
+        message: match fmt {
+            "srt" => "字幕转写完成 (SRT)",
+            "vtt" => "字幕转写完成 (VTT)",
+            _ => "转写完成",
+        }
+        .into(),
     })
 }
 
@@ -999,6 +1123,11 @@ async fn install_dependency(package_name: String) -> Result<DependencyInstallRes
 }
 
 #[tauri::command]
+fn get_drag_icon(app: AppHandle) -> String {
+    ensure_drag_icon(&app).to_string_lossy().to_string()
+}
+
+#[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     StdCommand::new("open")
         .args(["-R", &path])
@@ -1026,14 +1155,17 @@ fn open_target(target: String, ensure_directory: Option<bool>) -> Result<(), Str
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .invoke_handler(tauri::generate_handler![
             get_file_info,
             convert_image,
             export_markdown,
             video_to_gif,
+            compress_video,
             extract_audio,
             transcribe_audio,
             install_dependency,
+            get_drag_icon,
             reveal_in_finder,
             open_target,
         ])

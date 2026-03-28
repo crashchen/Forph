@@ -1,6 +1,8 @@
-import { CheckCircle2, FolderOpen, FileOutput, RotateCcw } from "lucide-react";
+import { useCallback } from "react";
+import { CheckCircle2, FolderOpen, FileOutput, RotateCcw, GripVertical } from "lucide-react";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import type { FileInfo, ConversionResult } from "../lib/types";
-import { revealInFinder, openTarget } from "../lib/commands";
+import { revealInFinder, openTarget, getDragIcon } from "../lib/commands";
 import { formatSize } from "../lib/format";
 
 interface ResultPanelProps {
@@ -23,6 +25,15 @@ function shortenPath(path: string): string {
 export function ResultPanel({ file, result, onReset }: ResultPanelProps) {
   const outputExt = result.output_path.split(".").pop()?.toUpperCase() || "";
 
+  const handleDragOut = useCallback(async () => {
+    try {
+      const icon = await getDragIcon();
+      await startDrag({ item: [result.output_path], icon });
+    } catch {
+      // Drag cancelled or not supported
+    }
+  }, [result.output_path]);
+
   return (
     <div className="animate-fade-up w-full max-w-lg">
       <div className="glass p-8 rounded-2xl text-center">
@@ -35,8 +46,13 @@ export function ResultPanel({ file, result, onReset }: ResultPanelProps) {
           {result.message}
         </h2>
 
-        {/* File info */}
-        <div className="mt-4 glass p-4 rounded-xl text-left">
+        {/* File info – draggable to other apps */}
+        <div
+          className="mt-4 glass p-4 rounded-xl text-left cursor-grab active:cursor-grabbing select-none transition-colors hover:ring-1 hover:ring-accent/20"
+          onMouseDown={() => {
+            void handleDragOut();
+          }}
+        >
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-accent-dim flex items-center justify-center shrink-0">
               <FileOutput size={18} className="text-accent" />
@@ -49,9 +65,11 @@ export function ResultPanel({ file, result, onReset }: ResultPanelProps) {
                 {outputExt} &middot; {formatSize(result.output_size)}
               </p>
             </div>
+            <GripVertical size={14} className="text-white/20 shrink-0" />
           </div>
-          <p className="text-[11px] text-white/25 mt-2 font-mono truncate">
+          <p className="text-[11px] text-white/20 mt-2 font-mono truncate">
             {shortenPath(result.output_path)}
+            <span className="ml-2 text-white/15">· 拖拽到其他应用</span>
           </p>
         </div>
 
