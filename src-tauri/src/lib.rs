@@ -3,10 +3,12 @@ use std::{
     collections::BTreeSet,
     env,
     ffi::OsString,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command as StdCommand,
+    process::{Command as StdCommand, ExitStatus, Stdio},
+    thread,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -91,6 +93,73 @@ struct ModelLookup {
     available_models: Vec<String>,
     requested_model_path: Option<PathBuf>,
     requested_model_uses_legacy_directory: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionProgressEvent {
+    job_id: String,
+    file_path: String,
+    stage: String,
+    percent: Option<f64>,
+    indeterminate: bool,
+    message: Option<String>,
+    current_seconds: Option<f64>,
+    total_seconds: Option<f64>,
+}
+
+#[derive(Debug, PartialEq)]
+enum FfmpegProgressUpdate {
+    OutTimeSeconds(f64),
+    End,
+}
+
+struct StreamCommandOutput {
+    status: ExitStatus,
+    stderr: String,
+}
+
+struct ProgressReporter {
+    app: AppHandle,
+    job_id: Option<String>,
+    file_path: String,
+}
+
+impl ProgressReporter {
+    fn new(app: AppHandle, job_id: Option<String>, file_path: String) -> Self {
+        Self {
+            app,
+            job_id,
+            file_path,
+        }
+    }
+
+    fn emit(
+        &self,
+        stage: &str,
+        percent: Option<f64>,
+        indeterminate: bool,
+        message: Option<&str>,
+        current_seconds: Option<f64>,
+        total_seconds: Option<f64>,
+    ) {
+        let Some(job_id) = self.job_id.clone() else {
+            return;
+        };
+
+        let event = ConversionProgressEvent {
+            job_id,
+            file_path: self.file_path.clone(),
+            stage: stage.to_string(),
+            percent: percent.map(|value| (value.clamp(0.0, 100.0) * 10.0).round() / 10.0),
+            indeterminate,
+            message: message.map(ToOwned::to_owned),
+            current_seconds,
+            total_seconds,
+        };
+
+        let _ = self.app.emit("forph://conversion-progress", event);
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────
@@ -661,6 +730,266 @@ fn ensure_drag_icon(app: &AppHandle) -> PathBuf {
     icon_path
 }
 
+fn max_long_edge_for_resolution(value: &str) -> Option<u32> {
+    match value {
+        "1080p" => Some(1080),
+        "720p" => Some(720),
+        "480p" => Some(480),
+        _ => None,
+    }
+}
+
+fn compression_scale_filter(max_long_edge: u32) -> String {
+    format!(
+        "scale='if(gt(iw,ih),min({0},iw),-2)':'if(gt(iw,ih),-2,min({0},ih))'",
+        max_long_edge
+    )
+}
+
+fn parse_ffmpeg_progress_line(line: &str) -> Option<FfmpegProgressUpdate> {
+    let (key, value) = line.split_once('=')?;
+    match key.trim() {
+        "out_time_us" | "out_time_ms" => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|microseconds| FfmpegProgressUpdate::OutTimeSeconds(microseconds / 1_000_000.0)),
+        "progress" if value.trim() == "end" => Some(FfmpegProgressUpdate::End),
+        _ => None,
+    }
+}
+
+fn parse_whisper_progress_percent(line: &str) -> Option<f64> {
+    line.split_whitespace().find_map(|token| {
+        let cleaned = token.trim_matches(|char: char| {
+            matches!(
+                char,
+                '[' | ']' | '(' | ')' | ',' | ':' | ';' | '"' | '\''
+            )
+        });
+
+        cleaned
+            .strip_suffix('%')
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(|value| value.clamp(0.0, 100.0))
+    })
+}
+
+fn consume_stream_lines<R: Read>(
+    mut reader: R,
+    mut on_line: impl FnMut(&str),
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 4096];
+    let mut pending = Vec::new();
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        for byte in &buffer[..bytes_read] {
+            if *byte == b'\n' || *byte == b'\r' {
+                if !pending.is_empty() {
+                    let line = String::from_utf8_lossy(&pending).trim().to_string();
+                    if !line.is_empty() {
+                        on_line(&line);
+                    }
+                    pending.clear();
+                }
+            } else {
+                pending.push(*byte);
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).trim().to_string();
+        if !line.is_empty() {
+            on_line(&line);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_command_streaming(
+    mut command: StdCommand,
+    mut on_stdout_line: impl FnMut(&str),
+) -> Result<StreamCommandOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| format!("命令启动失败: {}", e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取命令标准输出".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取命令错误输出".to_string())?;
+
+    let stderr_handle = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
+        text
+    });
+
+    let stdout_result = consume_stream_lines(stdout, |line| {
+        on_stdout_line(line);
+    });
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待命令结束失败: {}", e))?;
+    let stderr = stderr_handle.join().unwrap_or_default();
+
+    if let Err(error) = stdout_result {
+        return Err(format!("读取命令输出失败: {}", error));
+    }
+
+    Ok(StreamCommandOutput { status, stderr })
+}
+
+fn run_ffmpeg_with_progress(
+    reporter: &ProgressReporter,
+    ffmpeg: PathBuf,
+    mut args: Vec<String>,
+    stage: &str,
+    message: &str,
+    total_duration: Option<f64>,
+    progress_range: (f64, f64),
+) -> Result<String, String> {
+    let mut command = command_with_augmented_path(ffmpeg);
+    let mut full_args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-nostats".to_string(),
+        "-progress".to_string(),
+        "pipe:1".to_string(),
+    ];
+    full_args.append(&mut args);
+    command.args(&full_args);
+
+    let total_duration = total_duration.filter(|value| *value > 0.0);
+    reporter.emit(
+        stage,
+        total_duration.map(|_| progress_range.0),
+        total_duration.is_none(),
+        Some(message),
+        Some(0.0),
+        total_duration,
+    );
+
+    let mut last_percent: Option<f64> = None;
+    let output = run_command_streaming(command, |line| match parse_ffmpeg_progress_line(line) {
+        Some(FfmpegProgressUpdate::OutTimeSeconds(current_seconds)) => {
+            let Some(total_seconds) = total_duration else {
+                return;
+            };
+
+            let fraction = (current_seconds / total_seconds).clamp(0.0, 1.0);
+            let percent =
+                progress_range.0 + ((progress_range.1 - progress_range.0) * fraction);
+
+            let should_emit = last_percent
+                .map(|previous| (previous - percent).abs() >= 0.5)
+                .unwrap_or(true);
+            if should_emit {
+                reporter.emit(
+                    stage,
+                    Some(percent),
+                    false,
+                    Some(message),
+                    Some(current_seconds.min(total_seconds)),
+                    Some(total_seconds),
+                );
+                last_percent = Some(percent);
+            }
+        }
+        Some(FfmpegProgressUpdate::End) => {
+            if total_duration.is_some() {
+                reporter.emit(
+                    stage,
+                    Some(progress_range.1),
+                    false,
+                    Some(message),
+                    total_duration,
+                    total_duration,
+                );
+                last_percent = Some(progress_range.1);
+            }
+        }
+        None => {}
+    })?;
+
+    if !output.status.success() {
+        let details = output.stderr.trim();
+        return Err(if details.is_empty() {
+            "命令执行失败".into()
+        } else {
+            details.to_string()
+        });
+    }
+
+    Ok(output.stderr)
+}
+
+fn run_whisper_with_progress(
+    reporter: &ProgressReporter,
+    whisper_cmd: PathBuf,
+    args: Vec<String>,
+    message: &str,
+    progress_range: (f64, f64),
+) -> Result<String, String> {
+    let mut command = command_with_augmented_path(whisper_cmd);
+    command.args(&args);
+
+    reporter.emit(
+        "transcribe",
+        Some(progress_range.0),
+        true,
+        Some(message),
+        None,
+        None,
+    );
+
+    let mut last_percent: Option<f64> = None;
+    let output = run_command_streaming(command, |line| {
+        let Some(value) = parse_whisper_progress_percent(line) else {
+            return;
+        };
+
+        let percent =
+            progress_range.0 + ((progress_range.1 - progress_range.0) * (value / 100.0));
+        let should_emit = last_percent
+            .map(|previous| (previous - percent).abs() >= 1.0)
+            .unwrap_or(true);
+        if should_emit {
+            reporter.emit(
+                "transcribe",
+                Some(percent),
+                false,
+                Some(message),
+                None,
+                None,
+            );
+            last_percent = Some(percent);
+        }
+    })?;
+
+    if !output.status.success() {
+        let details = output.stderr.trim();
+        return Err(if details.is_empty() {
+            "命令执行失败".into()
+        } else {
+            details.to_string()
+        });
+    }
+
+    Ok(output.stderr)
+}
+
 // ─── Commands ────────────────────────────────────────────
 
 #[tauri::command]
@@ -819,11 +1148,13 @@ async fn export_markdown(input_path: String) -> Result<ConversionResult, String>
 
 #[tauri::command]
 async fn video_to_gif(
+    app: AppHandle,
     input_path: String,
     fps: u32,
     width: i32,
     start_time: Option<f64>,
     duration: Option<f64>,
+    job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
@@ -860,94 +1191,126 @@ async fn video_to_gif(
         out_str.clone(),
     ];
 
-    let r = command_with_augmented_path(ffmpeg)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let reporter = ProgressReporter::new(app, job_id, input_path.clone());
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "convert",
+            "正在转换 GIF...",
+            Some(clip_duration),
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("GIF 转换失败: {}", details))?;
 
-    if !r.status.success() {
-        return Err(format!(
-            "GIF 转换失败: {}",
-            String::from_utf8_lossy(&r.stderr)
-        ));
-    }
+        reporter.emit(
+            "convert",
+            Some(100.0),
+            false,
+            Some("GIF 转换完成"),
+            Some(clip_duration),
+            Some(clip_duration),
+        );
 
-    Ok(ConversionResult {
-        output_path: out_str,
-        output_size: file_size(&out),
-        message: format!(
-            "GIF 转换完成（{:.1}s - {:.1}s）",
-            start,
-            start + clip_duration
-        ),
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: format!(
+                "GIF 转换完成（{:.1}s - {:.1}s）",
+                start,
+                start + clip_duration
+            ),
+        })
     })
+    .await
+    .map_err(|error| format!("GIF 任务执行失败: {}", error))?
 }
 
 #[tauri::command]
 async fn extract_audio(
+    app: AppHandle,
     input_path: String,
     output_format: String,
+    job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
     };
 
+    let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
     let out = make_output_path(&input_path, &output_format);
     let out_str = out.to_string_lossy().to_string();
 
-    let args: Vec<&str> = match output_format.as_str() {
+    let args: Vec<String> = match output_format.as_str() {
         "mp3" => vec![
-            "-y",
-            "-i",
-            &input_path,
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-q:a",
-            "2",
-            &out_str,
+            "-y".into(),
+            "-i".into(),
+            input_path.clone(),
+            "-vn".into(),
+            "-acodec".into(),
+            "libmp3lame".into(),
+            "-q:a".into(),
+            "2".into(),
+            out_str.clone(),
         ],
         "wav" => vec![
-            "-y",
-            "-i",
-            &input_path,
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            &out_str,
+            "-y".into(),
+            "-i".into(),
+            input_path.clone(),
+            "-vn".into(),
+            "-acodec".into(),
+            "pcm_s16le".into(),
+            out_str.clone(),
         ],
         _ => return Err(format!("不支持的音频格式: {}", output_format)),
     };
 
-    let r = command_with_augmented_path(ffmpeg)
-        .args(args)
-        .output()
-        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let reporter = ProgressReporter::new(app, job_id, input_path);
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "extract",
+            "正在提取音频...",
+            total_duration,
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("音频提取失败: {}", details))?;
 
-    if !r.status.success() {
-        return Err(format!(
-            "音频提取失败: {}",
-            String::from_utf8_lossy(&r.stderr)
-        ));
-    }
+        reporter.emit(
+            "extract",
+            Some(100.0),
+            false,
+            Some("音频提取完成"),
+            total_duration,
+            total_duration,
+        );
 
-    Ok(ConversionResult {
-        output_path: out_str,
-        output_size: file_size(&out),
-        message: "音频提取完成".into(),
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: "音频提取完成".into(),
+        })
     })
+    .await
+    .map_err(|error| format!("音频提取任务执行失败: {}", error))?
 }
 
 #[tauri::command]
 async fn compress_video(
+    app: AppHandle,
     input_path: String,
     quality: String,
     max_resolution: Option<String>,
+    job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
     };
 
+    let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
     let crf = match quality.as_str() {
         "high" => "18",
         "small" => "28",
@@ -971,19 +1334,10 @@ async fn compress_video(
     ];
 
     if let Some(ref res) = max_resolution {
-        let max_w = match res.as_str() {
-            "1080p" => 1920,
-            "720p" => 1280,
-            "480p" => 854,
-            _ => 0,
-        };
-        if max_w > 0 {
+        if let Some(max_long_edge) = max_long_edge_for_resolution(res) {
             args.extend([
                 "-vf".into(),
-                format!(
-                    "scale='min({},iw)':-2",
-                    max_w
-                ),
+                compression_scale_filter(max_long_edge),
             ]);
         }
     }
@@ -996,23 +1350,36 @@ async fn compress_video(
         out_str.clone(),
     ]);
 
-    let r = command_with_augmented_path(ffmpeg)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let reporter = ProgressReporter::new(app, job_id, input_path);
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "compress",
+            "正在压缩视频...",
+            total_duration,
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("视频压缩失败: {}", details))?;
 
-    if !r.status.success() {
-        return Err(format!(
-            "视频压缩失败: {}",
-            String::from_utf8_lossy(&r.stderr)
-        ));
-    }
+        reporter.emit(
+            "compress",
+            Some(100.0),
+            false,
+            Some("视频压缩完成"),
+            total_duration,
+            total_duration,
+        );
 
-    Ok(ConversionResult {
-        output_path: out_str,
-        output_size: file_size(&out),
-        message: "视频压缩完成".into(),
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: "视频压缩完成".into(),
+        })
     })
+    .await
+    .map_err(|error| format!("视频压缩任务执行失败: {}", error))?
 }
 
 #[tauri::command]
@@ -1022,6 +1389,7 @@ async fn transcribe_audio(
     model_size: String,
     language: Option<String>,
     output_format: Option<String>,
+    job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp".into());
@@ -1041,31 +1409,12 @@ async fn transcribe_audio(
         ));
     };
 
+    let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
     let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    let r = command_with_augmented_path(ffmpeg)
-        .args([
-            "-y",
-            "-i",
-            &input_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            &tmp_wav_str,
-        ])
-        .output()
-        .map_err(|e| format!("ffmpeg 调用失败: {}", e))?;
-
-    if !r.status.success() {
-        return Err("音频预处理失败".into());
-    }
-
-    let fmt = output_format.as_deref().unwrap_or("txt");
-    let (whisper_output_flag, file_ext) = match fmt {
+    let fmt = output_format.unwrap_or_else(|| "txt".to_string());
+    let (whisper_output_flag, file_ext) = match fmt.as_str() {
         "srt" => ("-osrt", "srt"),
         "vtt" => ("-ovtt", "vtt"),
         _ => ("-otxt", "txt"),
@@ -1078,7 +1427,8 @@ async fn transcribe_audio(
         .unwrap_or(&out_str)
         .to_string();
 
-    let mut args = vec![
+    let mut whisper_args = vec![
+        "-pp".to_string(),
         "-m".to_string(),
         model_path.to_string_lossy().to_string(),
         "-f".into(),
@@ -1089,30 +1439,69 @@ async fn transcribe_audio(
     ];
 
     if let Some(lang) = language {
-        args.extend(["-l".into(), lang]);
+        whisper_args.extend(["-l".into(), lang]);
     }
 
-    let r = command_with_augmented_path(whisper_cmd)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("whisper 调用失败: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let reporter = ProgressReporter::new(app, job_id, input_path.clone());
+        let transcription = (|| {
+            run_ffmpeg_with_progress(
+                &reporter,
+                ffmpeg,
+                vec![
+                    "-y".into(),
+                    "-i".into(),
+                    input_path.clone(),
+                    "-ar".into(),
+                    "16000".into(),
+                    "-ac".into(),
+                    "1".into(),
+                    "-c:a".into(),
+                    "pcm_s16le".into(),
+                    tmp_wav_str.clone(),
+                ],
+                "preprocess",
+                "正在预处理音频...",
+                total_duration,
+                (0.0, 25.0),
+            )
+            .map_err(|_| "音频预处理失败".to_string())?;
 
-    let _ = std::fs::remove_file(&tmp_wav);
+            run_whisper_with_progress(
+                &reporter,
+                whisper_cmd,
+                whisper_args,
+                "正在转写音频...",
+                (25.0, 95.0),
+            )
+            .map_err(|details| format!("转写失败: {}", details))?;
 
-    if !r.status.success() {
-        return Err(format!("转写失败: {}", String::from_utf8_lossy(&r.stderr)));
-    }
+            reporter.emit(
+                "finalize",
+                Some(100.0),
+                false,
+                Some("转写完成"),
+                total_duration,
+                total_duration,
+            );
 
-    Ok(ConversionResult {
-        output_path: out_str,
-        output_size: file_size(&out),
-        message: match fmt {
-            "srt" => "字幕转写完成 (SRT)",
-            "vtt" => "字幕转写完成 (VTT)",
-            _ => "转写完成",
-        }
-        .into(),
+            Ok(ConversionResult {
+                output_path: out_str,
+                output_size: file_size(&out),
+                message: match fmt.as_str() {
+                    "srt" => "字幕转写完成 (SRT)",
+                    "vtt" => "字幕转写完成 (VTT)",
+                    _ => "转写完成",
+                }
+                .into(),
+            })
+        })();
+
+        let _ = std::fs::remove_file(&tmp_wav);
+        transcription
     })
+    .await
+    .map_err(|error| format!("转写任务执行失败: {}", error))?
 }
 
 #[tauri::command]
@@ -1226,7 +1615,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_gif_window, strip_frontmatter};
+    use super::{
+        clamp_gif_window, compression_scale_filter, max_long_edge_for_resolution,
+        parse_ffmpeg_progress_line, strip_frontmatter, FfmpegProgressUpdate,
+    };
 
     #[test]
     fn keeps_markdown_without_frontmatter() {
@@ -1276,5 +1668,43 @@ mod tests {
         let (start, duration) = clamp_gif_window(None, None, Some(20.0));
         assert_eq!(start, 0.0);
         assert_eq!(duration, 5.0);
+    }
+
+    #[test]
+    fn maps_resolution_presets_to_long_edge_caps() {
+        assert_eq!(max_long_edge_for_resolution("1080p"), Some(1080));
+        assert_eq!(max_long_edge_for_resolution("720p"), Some(720));
+        assert_eq!(max_long_edge_for_resolution("480p"), Some(480));
+        assert_eq!(max_long_edge_for_resolution("unknown"), None);
+    }
+
+    #[test]
+    fn builds_portrait_safe_compression_scale_filter() {
+        assert_eq!(
+            compression_scale_filter(1080),
+            "scale='if(gt(iw,ih),min(1080,iw),-2)':'if(gt(iw,ih),-2,min(1080,ih))'"
+        );
+    }
+
+    #[test]
+    fn parses_ffmpeg_out_time_progress_lines() {
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time_us=1000000"),
+            Some(FfmpegProgressUpdate::OutTimeSeconds(1.0))
+        );
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time_ms=2500000"),
+            Some(FfmpegProgressUpdate::OutTimeSeconds(2.5))
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_ffmpeg_progress_lines() {
+        assert_eq!(parse_ffmpeg_progress_line("out_time_us=oops"), None);
+        assert_eq!(parse_ffmpeg_progress_line("bitrate=400kbits/s"), None);
+        assert_eq!(
+            parse_ffmpeg_progress_line("progress=end"),
+            Some(FfmpegProgressUpdate::End)
+        );
     }
 }

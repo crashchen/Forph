@@ -8,7 +8,7 @@ import { ResultPanel } from "./components/ResultPanel";
 import { BatchPanel } from "./components/BatchPanel";
 import { getFileInfo } from "./lib/commands";
 import { getErrorMessage } from "./lib/errors";
-import type { AppView, FileInfo } from "./lib/types";
+import type { AppView, BatchImportSummary, FileInfo } from "./lib/types";
 
 const appWindow = getCurrentWindow();
 
@@ -63,19 +63,37 @@ export default function App() {
 
     // Batch mode
     try {
-      const infos = await Promise.all(paths.map((p) => getFileInfo(p)));
-      const supported = infos.filter((f) => f.file_type !== "unknown");
+      const settled = await Promise.allSettled(paths.map((p) => getFileInfo(p)));
+      const supported: FileInfo[] = [];
+      let unreadableCount = 0;
+      let unsupportedCount = 0;
+
+      for (const result of settled) {
+        if (result.status === "rejected") {
+          unreadableCount += 1;
+          continue;
+        }
+
+        if (result.value.file_type === "unknown") {
+          unsupportedCount += 1;
+          continue;
+        }
+
+        supported.push(result.value);
+      }
 
       if (supported.length === 0) {
         setView({
           stage: "error",
           file: buildFallbackFileInfo(paths[0]),
-          error: "所有文件格式都不支持",
+          error:
+            unreadableCount > 0
+              ? "选中的文件都无法读取或格式不受支持"
+              : "所有文件格式都不支持",
         });
         return;
       }
 
-      // Group by dominant type
       const typeCounts: Record<string, number> = {};
       for (const f of supported) {
         typeCounts[f.file_type] = (typeCounts[f.file_type] || 0) + 1;
@@ -87,11 +105,13 @@ export default function App() {
         (f) => f.file_type === dominantType,
       );
 
-      if (batchFiles.length === 1) {
-        setView({ stage: "actions", file: batchFiles[0] });
-      } else {
-        setView({ stage: "batch", files: batchFiles });
-      }
+      const importSummary: BatchImportSummary = {
+        unsupportedCount,
+        unreadableCount,
+        filteredOutCount: supported.length - batchFiles.length,
+      };
+
+      setView({ stage: "batch", files: batchFiles, importSummary });
     } catch (error) {
       console.error(error);
       setView({
@@ -183,8 +203,8 @@ export default function App() {
             <FileActions
               file={view.file}
               isDragOver={isDragOver}
-              onConversionStart={(actionId) =>
-                setView({ stage: "converting", file: view.file, actionId })
+              onConversionStart={(actionId, jobId) =>
+                setView({ stage: "converting", file: view.file, actionId, jobId })
               }
               onFileRefreshed={(sourcePath, file) =>
                 setView((currentView) => {
@@ -208,7 +228,11 @@ export default function App() {
             />
           )}
           {view.stage === "converting" && (
-            <Converting file={view.file} actionId={view.actionId} />
+            <Converting
+              file={view.file}
+              actionId={view.actionId}
+              jobId={view.jobId}
+            />
           )}
           {view.stage === "done" && (
             <ResultPanel
@@ -220,10 +244,13 @@ export default function App() {
           {view.stage === "batch" && (
             <BatchPanel
               files={view.files}
+              importSummary={view.importSummary}
               isDragOver={isDragOver}
               onFilesRefreshed={(files) =>
                 setView((v) =>
-                  v.stage === "batch" ? { stage: "batch", files } : v,
+                  v.stage === "batch"
+                    ? { stage: "batch", files, importSummary: v.importSummary }
+                    : v,
                 )
               }
               onReset={reset}

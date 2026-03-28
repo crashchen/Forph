@@ -18,7 +18,10 @@ import {
 } from "../lib/commands";
 import { formatSize, formatDuration } from "../lib/format";
 import { getErrorMessage } from "../lib/errors";
-import { getActionDisabledReason } from "../lib/actions";
+import {
+  actionUsesRealtimeProgress,
+  getActionDisabledReason,
+} from "../lib/actions";
 import { GifOptions } from "./GifOptions";
 import { CompressOptions } from "./CompressOptions";
 import { ImageOptions } from "./ImageOptions";
@@ -27,7 +30,7 @@ import { DependencySection, type InstallableDependency } from "./DependencySecti
 interface FileActionsProps {
   file: FileInfo;
   isDragOver: boolean;
-  onConversionStart: (actionId: string) => void;
+  onConversionStart: (actionId: string, jobId?: string) => void;
   onFileRefreshed: (sourcePath: string, file: FileInfo) => void;
   onResult: (result: ConversionResult) => void;
   onError: (error: string) => void;
@@ -60,6 +63,15 @@ function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo |
   }
 
   return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+function createJobId(actionId: string, filePath: string): string {
+  const suffix =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const name = filePath.split("/").pop() ?? "file";
+  return `${actionId}:${name}:${suffix}`;
 }
 
 
@@ -105,31 +117,34 @@ export function FileActions({
 
   const executeAction = useCallback(
     async (action: FileAction) => {
-      onConversionStart(action.id);
+      const jobId = actionUsesRealtimeProgress(action.id)
+        ? createJobId(action.id, file.path)
+        : undefined;
+      onConversionStart(action.id, jobId);
       try {
         let result: ConversionResult;
 
         if (action.id === "md_html") {
           result = await exportMarkdown(file.path);
         } else if (action.id === "vid_mp3" || action.id === "aud_mp3") {
-          result = await extractAudio(file.path, "mp3");
+          result = await extractAudio(file.path, "mp3", jobId);
         } else if (action.id === "vid_wav" || action.id === "aud_wav") {
-          result = await extractAudio(file.path, "wav");
+          result = await extractAudio(file.path, "wav", jobId);
         } else if (
           action.id === "vid_transcribe" ||
           action.id === "aud_transcribe"
         ) {
-          result = await transcribeAudio(file.path, "base");
+          result = await transcribeAudio(file.path, "base", undefined, undefined, jobId);
         } else if (
           action.id === "vid_transcribe_srt" ||
           action.id === "aud_transcribe_srt"
         ) {
-          result = await transcribeAudio(file.path, "base", undefined, "srt");
+          result = await transcribeAudio(file.path, "base", undefined, "srt", jobId);
         } else if (
           action.id === "vid_transcribe_vtt" ||
           action.id === "aud_transcribe_vtt"
         ) {
-          result = await transcribeAudio(file.path, "base", undefined, "vtt");
+          result = await transcribeAudio(file.path, "base", undefined, "vtt", jobId);
         } else {
           throw new Error(`未知操作: ${action.id}`);
         }
@@ -211,9 +226,10 @@ export function FileActions({
 
   const handleCompress = useCallback(
     async (quality: string, maxResolution?: string) => {
-      onConversionStart("vid_compress");
+      const jobId = createJobId("vid_compress", file.path);
+      onConversionStart("vid_compress", jobId);
       try {
-        const result = await compressVideo(file.path, quality, maxResolution);
+        const result = await compressVideo(file.path, quality, maxResolution, jobId);
         onResult(result);
       } catch (error) {
         onError(getErrorMessage(error, "视频压缩失败"));
@@ -229,9 +245,17 @@ export function FileActions({
       startTime: number,
       duration: number,
     ) => {
-      onConversionStart("vid_gif");
+      const jobId = createJobId("vid_gif", file.path);
+      onConversionStart("vid_gif", jobId);
       try {
-        const result = await videoToGif(file.path, fps, width, startTime, duration);
+        const result = await videoToGif(
+          file.path,
+          fps,
+          width,
+          startTime,
+          duration,
+          jobId,
+        );
         onResult(result);
       } catch (error) {
         onError(getErrorMessage(error, "GIF 转换失败"));

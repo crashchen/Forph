@@ -47,16 +47,46 @@ export interface DependencyInstallResult {
   message: string;
 }
 
+export type BatchFileStatus =
+  | "pending"
+  | "running"
+  | "success"
+  | "error"
+  | "skipped"
+  | "cancelled";
+
 export interface BatchFileResult {
   file: FileInfo;
+  status: BatchFileStatus;
   result?: ConversionResult;
   error?: string;
+}
+
+export interface BatchImportSummary {
+  unsupportedCount: number;
+  unreadableCount: number;
+  filteredOutCount: number;
+}
+
+export interface ConversionProgressEvent {
+  jobId: string;
+  filePath: string;
+  stage: string;
+  percent?: number | null;
+  indeterminate: boolean;
+  message?: string | null;
+  currentSeconds?: number | null;
+  totalSeconds?: number | null;
 }
 
 export type AppView =
   | { stage: "idle" }
   | { stage: "actions"; file: FileInfo }
-  | { stage: "converting"; file: FileInfo; actionId: string }
+  | { stage: "converting"; file: FileInfo; actionId: string; jobId?: string }
   | { stage: "done"; file: FileInfo; result: ConversionResult }
   | { stage: "error"; file: FileInfo; error: string }
-  | { stage: "batch"; files: FileInfo[] };
+  | {
+      stage: "batch";
+      files: FileInfo[];
+      importSummary: BatchImportSummary;
+    };
