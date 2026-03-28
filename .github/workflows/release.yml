@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos-release:
+    name: Build and publish macOS release
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Validate tag matches app versions
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          node <<'EOF'
+          const fs = require("fs");
+          const tagVersion = process.env.TAG_NAME.replace(/^v/, "");
+          const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const tauriConfig = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
+          const cargoToml = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+          const cargoMatch = cargoToml.match(/^\s*version\s*=\s*"([^"]+)"/m);
+
+          if (!cargoMatch) {
+            throw new Error("Could not find version in src-tauri/Cargo.toml");
+          }
+
+          const versions = {
+            "package.json": packageJson.version,
+            "src-tauri/tauri.conf.json": tauriConfig.version,
+            "src-tauri/Cargo.toml": cargoMatch[1],
+          };
+
+          const mismatches = Object.entries(versions).filter(([, version]) => version !== tagVersion);
+          if (mismatches.length > 0) {
+            console.error(`Tag ${process.env.TAG_NAME} does not match app versions:`);
+            for (const [file, version] of mismatches) {
+              console.error(`- ${file}: ${version}`);
+            }
+            process.exit(1);
+          }
+
+          console.log(`Release tag ${process.env.TAG_NAME} matches project version ${tagVersion}.`);
+          EOF
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build release app bundle
+        run: npx tauri build --bundles app
+
+      - name: Zip Forph.app
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          ditto -c -k --keepParent \
+            src-tauri/target/release/bundle/macos/Forph.app \
+            "Forph-${TAG_NAME}-macos.zip"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            Forph-${{ github.ref_name }}-macos.zip

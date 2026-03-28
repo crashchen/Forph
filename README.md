@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/crashchen/Forph/actions/workflows/ci.yml/badge.svg)](https://github.com/crashchen/Forph/actions/workflows/ci.yml)
 [![Manual macOS Bundle](https://github.com/crashchen/Forph/actions/workflows/macos-bundle.yml/badge.svg)](https://github.com/crashchen/Forph/actions/workflows/macos-bundle.yml)
+[![Release](https://github.com/crashchen/Forph/actions/workflows/release.yml/badge.svg)](https://github.com/crashchen/Forph/actions/workflows/release.yml)
 
 Forph 是一个 macOS 本地文件转换器，主打拖拽即处理、文件本地处理和轻量分发。当前版本把稳定高频的媒体处理链路打磨成第一优先级：视频压缩、转 GIF、提取音频、本地离线转写与字幕生成。
 
@@ -53,8 +54,24 @@ npx tauri dev
 
 - `CI`：用于日常 `push / pull_request` 的轻量检查，只跑前端 `lint + build` 和 macOS 上的 `cargo test`，尽量省 action 分钟。
 - `Manual macOS Bundle`：只在你手动触发时跑完整的 `npx tauri build --debug --bundles app`，并把 `Forph.app` 作为 artifact 上传，适合需要远程验证桌面打包时再用。
+- `Release`：只在你推送版本 tag 时触发，例如 `v0.1.0`。它会校验 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 的版本是否和 tag 一致，然后构建 release 版 `Forph.app`，自动创建 GitHub Release，并上传压缩产物。
 
 这套配置对 Forph 是值得的，因为它能在不频繁烧 macOS 分钟的前提下，尽早挡住前端回归、Rust 单测失败和打包链路问题。
+
+标准发版流程：
+
+1. 先把版本号同步更新到 `package.json`、`src-tauri/tauri.conf.json` 和 `src-tauri/Cargo.toml`
+2. 提交并推送到 `main`
+3. 创建并推送版本 tag，例如：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+4. GitHub Actions 会自动跑 `Release` 工作流，在 Releases 页面生成对应版本并附上 macOS 产物
+
+当前这条 release 流程上传的是压缩后的 `Forph.app`，还没有做签名和 notarization；如果后续你要对外正式分发，再继续补这两步会更标准。
 
 ## Optional Runtime Dependencies
 
