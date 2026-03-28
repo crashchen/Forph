@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - "package.json"
+      - "package-lock.json"
+      - "eslint.config.js"
+      - "tsconfig*.json"
+      - "vite.config.ts"
+      - "index.html"
+      - "src/**"
+      - "src-tauri/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - "package.json"
+      - "package-lock.json"
+      - "eslint.config.js"
+      - "tsconfig*.json"
+      - "vite.config.ts"
+      - "index.html"
+      - "src/**"
+      - "src-tauri/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
+  rust-tests:
+    name: Rust Tests (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test

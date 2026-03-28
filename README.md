@@ -1,5 +1,8 @@
 # Forph
 
+[![CI](https://github.com/crashchen/Forph/actions/workflows/ci.yml/badge.svg)](https://github.com/crashchen/Forph/actions/workflows/ci.yml)
+[![Manual macOS Bundle](https://github.com/crashchen/Forph/actions/workflows/macos-bundle.yml/badge.svg)](https://github.com/crashchen/Forph/actions/workflows/macos-bundle.yml)
+
 Forph 是一个 macOS 本地文件转换器，主打拖拽即处理、文件本地处理和轻量分发。当前版本把稳定高频的媒体处理链路打磨成第一优先级：视频压缩、转 GIF、提取音频、本地离线转写与字幕生成。
 
 ## Current Features
@@ -43,6 +46,15 @@ npm run dev
 ```bash
 npx tauri dev
 ```
+
+## GitHub Actions
+
+仓库现在带了两条 GitHub Actions 工作流：
+
+- `CI`：用于日常 `push / pull_request` 的轻量检查，只跑前端 `lint + build` 和 macOS 上的 `cargo test`，尽量省 action 分钟。
+- `Manual macOS Bundle`：只在你手动触发时跑完整的 `npx tauri build --debug --bundles app`，并把 `Forph.app` 作为 artifact 上传，适合需要远程验证桌面打包时再用。
+
+这套配置对 Forph 是值得的，因为它能在不频繁烧 macOS 分钟的前提下，尽早挡住前端回归、Rust 单测失败和打包链路问题。
 
 ## Optional Runtime Dependencies
 

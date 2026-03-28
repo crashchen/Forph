@@ -1,0 +1,50 @@
+name: Manual macOS Bundle
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bundle-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-app:
+    name: Build Forph.app
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build debug app bundle
+        run: npx tauri build --debug --bundles app
+
+      - name: Zip Forph.app
+        run: ditto -c -k --keepParent src-tauri/target/debug/bundle/macos/Forph.app forph-debug-app.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forph-debug-app
+          path: forph-debug-app.zip
+          if-no-files-found: error
