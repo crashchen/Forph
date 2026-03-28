@@ -6,6 +6,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command as StdCommand, ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     thread,
 };
 use tauri::{AppHandle, Emitter, Manager};
@@ -119,6 +120,7 @@ struct StreamCommandOutput {
     stderr: String,
 }
 
+#[derive(Clone)]
 struct ProgressReporter {
     app: AppHandle,
     job_id: Option<String>,
@@ -816,6 +818,7 @@ fn consume_stream_lines<R: Read>(
 fn run_command_streaming(
     mut command: StdCommand,
     mut on_stdout_line: impl FnMut(&str),
+    mut on_stderr_line: impl FnMut(&str) + Send + 'static,
 ) -> Result<StreamCommandOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -829,10 +832,14 @@ fn run_command_streaming(
         .take()
         .ok_or_else(|| "无法读取命令错误输出".to_string())?;
 
-    let stderr_handle = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
-        text
+    let stderr_handle = thread::spawn(move || -> Result<String, String> {
+        let mut lines = Vec::new();
+        consume_stream_lines(stderr, |line| {
+            lines.push(line.to_string());
+            on_stderr_line(line);
+        })
+        .map_err(|error| format!("读取命令错误输出失败: {}", error))?;
+        Ok(lines.join("\n"))
     });
 
     let stdout_result = consume_stream_lines(stdout, |line| {
@@ -841,7 +848,9 @@ fn run_command_streaming(
     let status = child
         .wait()
         .map_err(|e| format!("等待命令结束失败: {}", e))?;
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| "读取命令错误输出失败: 线程中断".to_string())??;
 
     if let Err(error) = stdout_result {
         return Err(format!("读取命令输出失败: {}", error));
@@ -921,7 +930,7 @@ fn run_ffmpeg_with_progress(
             }
         }
         None => {}
-    })?;
+    }, |_| {})?;
 
     if !output.status.success() {
         let details = output.stderr.trim();
@@ -933,6 +942,39 @@ fn run_ffmpeg_with_progress(
     }
 
     Ok(output.stderr)
+}
+
+fn emit_whisper_progress_from_line(
+    reporter: &ProgressReporter,
+    line: &str,
+    message: &str,
+    progress_range: (f64, f64),
+    last_percent: &Arc<Mutex<Option<f64>>>,
+) {
+    let Some(value) = parse_whisper_progress_percent(line) else {
+        return;
+    };
+
+    let percent = progress_range.0 + ((progress_range.1 - progress_range.0) * (value / 100.0));
+    let mut guard = match last_percent.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    let should_emit = guard
+        .map(|previous| (previous - percent).abs() >= 1.0)
+        .unwrap_or(true);
+    if should_emit {
+        reporter.emit(
+            "transcribe",
+            Some(percent),
+            false,
+            Some(message),
+            None,
+            None,
+        );
+        *guard = Some(percent);
+    }
 }
 
 fn run_whisper_with_progress(
@@ -954,29 +996,35 @@ fn run_whisper_with_progress(
         None,
     );
 
-    let mut last_percent: Option<f64> = None;
-    let output = run_command_streaming(command, |line| {
-        let Some(value) = parse_whisper_progress_percent(line) else {
-            return;
-        };
+    let last_percent = Arc::new(Mutex::new(None::<f64>));
+    let reporter_stdout = reporter.clone();
+    let reporter_stderr = reporter.clone();
+    let message_owned = message.to_string();
+    let message_for_stderr = message_owned.clone();
+    let last_percent_for_stdout = Arc::clone(&last_percent);
+    let last_percent_for_stderr = Arc::clone(&last_percent);
 
-        let percent =
-            progress_range.0 + ((progress_range.1 - progress_range.0) * (value / 100.0));
-        let should_emit = last_percent
-            .map(|previous| (previous - percent).abs() >= 1.0)
-            .unwrap_or(true);
-        if should_emit {
-            reporter.emit(
-                "transcribe",
-                Some(percent),
-                false,
-                Some(message),
-                None,
-                None,
+    let output = run_command_streaming(
+        command,
+        |line| {
+            emit_whisper_progress_from_line(
+                &reporter_stdout,
+                line,
+                &message_owned,
+                progress_range,
+                &last_percent_for_stdout,
             );
-            last_percent = Some(percent);
-        }
-    })?;
+        },
+        move |line| {
+            emit_whisper_progress_from_line(
+                &reporter_stderr,
+                line,
+                &message_for_stderr,
+                progress_range,
+                &last_percent_for_stderr,
+            );
+        },
+    )?;
 
     if !output.status.success() {
         let details = output.stderr.trim();
@@ -1617,7 +1665,8 @@ pub fn run() {
 mod tests {
     use super::{
         clamp_gif_window, compression_scale_filter, max_long_edge_for_resolution,
-        parse_ffmpeg_progress_line, strip_frontmatter, FfmpegProgressUpdate,
+        parse_ffmpeg_progress_line, parse_whisper_progress_percent, strip_frontmatter,
+        FfmpegProgressUpdate,
     };
 
     #[test]
@@ -1706,5 +1755,12 @@ mod tests {
             parse_ffmpeg_progress_line("progress=end"),
             Some(FfmpegProgressUpdate::End)
         );
+    }
+
+    #[test]
+    fn parses_whisper_progress_from_wrapped_tokens() {
+        assert_eq!(parse_whisper_progress_percent("[42%]"), Some(42.0));
+        assert_eq!(parse_whisper_progress_percent("progress: 87.5%"), Some(87.5));
+        assert_eq!(parse_whisper_progress_percent("no-progress-here"), None);
     }
 }

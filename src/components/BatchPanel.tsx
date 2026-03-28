@@ -34,7 +34,11 @@ import {
   transcribeAudio,
   videoToGif,
 } from "../lib/commands";
-import { formatSize } from "../lib/format";
+import {
+  formatProgressStage,
+  formatProgressTimeRange,
+  formatSize,
+} from "../lib/format";
 import { getErrorMessage } from "../lib/errors";
 import {
   actionUsesRealtimeProgress,
@@ -136,7 +140,7 @@ function buildStatusLabel(result: BatchFileResult): string {
     case "skipped":
       return "已跳过";
     case "cancelled":
-      return "未继续";
+      return "剩余项未执行";
     case "running":
       return "处理中";
     default:
@@ -214,7 +218,12 @@ export function BatchPanel({
   const [currentFileProgress, setCurrentFileProgress] = useState<number | null>(
     null,
   );
+  const [currentProgressIndeterminate, setCurrentProgressIndeterminate] =
+    useState(true);
   const [currentMessage, setCurrentMessage] = useState("准备开始处理...");
+  const [currentStage, setCurrentStage] = useState<string | null>(null);
+  const [currentSeconds, setCurrentSeconds] = useState<number | null>(null);
+  const [totalSeconds, setTotalSeconds] = useState<number | null>(null);
   const [showGifOptions, setShowGifOptions] = useState(false);
   const [showCompressOptions, setShowCompressOptions] = useState(false);
   const [imageOutputFormat, setImageOutputFormat] = useState<string | null>(null);
@@ -227,6 +236,7 @@ export function BatchPanel({
   const [lastRunContext, setLastRunContext] = useState<BatchRunContext | null>(
     null,
   );
+  const [stopRequested, setStopRequested] = useState(false);
   const stopAfterCurrentRef = useRef(false);
   const isMountedRef = useRef(true);
   const resultsRef = useRef(results);
@@ -248,12 +258,17 @@ export function BatchPanel({
     setCurrentIndex(null);
     setCurrentJobId(null);
     setCurrentFileProgress(null);
+    setCurrentProgressIndeterminate(true);
     setCurrentMessage("准备开始处理...");
+    setCurrentStage(null);
+    setCurrentSeconds(null);
+    setTotalSeconds(null);
     setShowGifOptions(false);
     setShowCompressOptions(false);
     setImageOutputFormat(null);
     setDependencyMessage(null);
     setDependencyError(null);
+    setStopRequested(false);
     stopAfterCurrentRef.current = false;
   }, [files]);
 
@@ -267,7 +282,11 @@ export function BatchPanel({
       }
 
       setCurrentFileProgress(event.percent ?? null);
+      setCurrentProgressIndeterminate(event.indeterminate);
       setCurrentMessage(event.message ?? "正在处理当前文件...");
+      setCurrentStage(event.stage);
+      setCurrentSeconds(event.currentSeconds ?? null);
+      setTotalSeconds(event.totalSeconds ?? null);
     }).then((fn) => {
       if (disposed) {
         fn();
@@ -304,7 +323,12 @@ export function BatchPanel({
       setCurrentIndex(null);
       setCurrentJobId(null);
       setCurrentFileProgress(null);
+      setCurrentProgressIndeterminate(true);
       setCurrentMessage("准备开始处理...");
+      setCurrentStage(null);
+      setCurrentSeconds(null);
+      setTotalSeconds(null);
+      setStopRequested(false);
       stopAfterCurrentRef.current = false;
 
       const nextResults =
@@ -359,7 +383,11 @@ export function BatchPanel({
           setCurrentIndex(index);
           setCurrentJobId(jobId ?? null);
           setCurrentFileProgress(jobId ? 0 : null);
+          setCurrentProgressIndeterminate(Boolean(jobId));
           setCurrentMessage("正在处理当前文件...");
+          setCurrentStage(null);
+          setCurrentSeconds(null);
+          setTotalSeconds(null);
           setResults([...nextResults]);
         }
 
@@ -384,6 +412,10 @@ export function BatchPanel({
 
         setCurrentJobId(null);
         setCurrentFileProgress(null);
+        setCurrentProgressIndeterminate(true);
+        setCurrentStage(null);
+        setCurrentSeconds(null);
+        setTotalSeconds(null);
         setResults([...nextResults]);
       }
 
@@ -407,9 +439,13 @@ export function BatchPanel({
         setCurrentIndex(null);
         setCurrentJobId(null);
         setCurrentFileProgress(null);
+        setCurrentProgressIndeterminate(true);
         setCurrentMessage(
-          stopped ? "已按你的要求在当前文件后停止。" : "全部处理完成。",
+          stopped ? "已按你的要求在当前文件后停止，剩余项未执行。" : "全部处理完成。",
         );
+        setCurrentStage(null);
+        setCurrentSeconds(null);
+        setTotalSeconds(null);
         setCompletionState(stopped ? "stopped" : "completed");
         setPhase("done");
       }
@@ -463,15 +499,29 @@ export function BatchPanel({
           return;
         }
 
-        const refreshed = await Promise.all(
+        const refreshedSettled = await Promise.allSettled(
           files.map((file) => getFileInfo(file.path)),
         );
         if (!isMountedRef.current) {
           return;
         }
 
+        let refreshFailures = 0;
+        const refreshed = refreshedSettled.map((entry, index) => {
+          if (entry.status === "fulfilled") {
+            return entry.value;
+          }
+
+          refreshFailures += 1;
+          return files[index];
+        });
+
         onFilesRefreshed(refreshed);
-        setDependencyMessage(`${result.message} 文件列表已刷新。`);
+        setDependencyMessage(
+          refreshFailures > 0
+            ? `${result.message} 已刷新 ${files.length - refreshFailures} 个文件，${refreshFailures} 个保留原状态。`
+            : `${result.message} 文件列表已刷新。`,
+        );
       } catch (error) {
         if (!isMountedRef.current) {
           return;
@@ -713,6 +763,14 @@ export function BatchPanel({
         : 0;
     const currentFile =
       currentIndex != null && currentIndex < files.length ? files[currentIndex] : null;
+    const currentStageLabel = formatProgressStage(currentStage);
+    const currentTimeRange = formatProgressTimeRange(currentSeconds, totalSeconds);
+    const currentPercentLabel = currentProgressIndeterminate
+      ? null
+      : formatPercent(currentFileProgress);
+    const currentMeta = [currentStageLabel, currentPercentLabel, currentTimeRange].filter(
+      Boolean,
+    );
 
     return (
       <div className="animate-fade-up w-full max-w-lg">
@@ -736,9 +794,9 @@ export function BatchPanel({
           </div>
 
           <p className="text-xs text-white/25 mt-4">{currentMessage}</p>
-          {formatPercent(currentFileProgress) && (
+          {currentMeta.length > 0 && (
             <p className="text-xs text-white/35 mt-1 font-mono">
-              当前文件 {formatPercent(currentFileProgress)}
+              当前文件 {currentMeta.join(" · ")}
             </p>
           )}
 
@@ -773,10 +831,16 @@ export function BatchPanel({
           <button
             onClick={() => {
               stopAfterCurrentRef.current = true;
+              setStopRequested(true);
             }}
-            className="no-drag mt-5 px-5 py-2 rounded-xl text-sm text-white/40 hover:text-white/60 hover:bg-white/5 transition-colors cursor-pointer"
+            disabled={stopRequested}
+            className={`no-drag mt-5 px-5 py-2 rounded-xl text-sm transition-colors ${
+              stopRequested
+                ? "cursor-not-allowed bg-warning/10 text-warning"
+                : "cursor-pointer text-white/40 hover:text-white/60 hover:bg-white/5"
+            }`}
           >
-            处理完当前文件后停止
+            {stopRequested ? "已请求：当前文件完成后停止" : "处理完当前文件后停止"}
           </button>
         </div>
       </div>
@@ -817,7 +881,7 @@ export function BatchPanel({
             <span className="text-white/35 ml-2">{skippedResults.length} 跳过</span>
           )}
           {cancelledResults.length > 0 && (
-            <span className="text-warning ml-2">{cancelledResults.length} 未继续</span>
+            <span className="text-warning ml-2">{cancelledResults.length} 未执行</span>
           )}
         </p>
 

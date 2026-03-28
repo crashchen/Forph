@@ -2,6 +2,11 @@ import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import type { FileInfo } from "../lib/types";
 import { listenConversionProgress } from "../lib/commands";
+import {
+  formatMediaClock,
+  formatProgressStage,
+  formatProgressTimeRange,
+} from "../lib/format";
 
 interface ConvertingProps {
   file: FileInfo;
@@ -41,6 +46,9 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
   const [percent, setPercent] = useState<number | null>(null);
   const [indeterminate, setIndeterminate] = useState(true);
   const [message, setMessage] = useState<string>("请稍候，正在本地处理...");
+  const [stage, setStage] = useState<string | null>(null);
+  const [currentSeconds, setCurrentSeconds] = useState<number | null>(null);
+  const [totalSeconds, setTotalSeconds] = useState<number | null>(null);
 
   useEffect(() => {
     if (!jobId) {
@@ -57,6 +65,9 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
 
       setIndeterminate(event.indeterminate);
       setPercent(event.percent ?? null);
+      setStage(event.stage);
+      setCurrentSeconds(event.currentSeconds ?? null);
+      setTotalSeconds(event.totalSeconds ?? null);
       if (event.message) {
         setMessage(event.message);
       }
@@ -74,8 +85,15 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
     };
   }, [file.path, jobId]);
 
-  const displayPercent = formatPercent(percent);
+  const displayPercent = indeterminate ? null : formatPercent(percent);
   const progressWidth = percent != null ? `${Math.max(0, Math.min(100, percent))}%` : "100%";
+  const stageLabel = formatProgressStage(stage);
+  const timeRange = formatProgressTimeRange(currentSeconds, totalSeconds);
+  const currentTimeOnly =
+    timeRange == null ? formatMediaClock(currentSeconds) : null;
+  const progressMeta = [stageLabel, displayPercent, timeRange ?? currentTimeOnly].filter(
+    Boolean,
+  );
 
   return (
     <div className="animate-fade-up text-center max-w-md">
@@ -93,11 +111,11 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
           />
         </div>
 
-        <p className="text-xs text-white/25 mt-4">
-          {message}
-        </p>
-        {displayPercent && (
-          <p className="text-xs text-white/35 mt-1 font-mono">{displayPercent}</p>
+        <p className="text-xs text-white/25 mt-4">{message}</p>
+        {progressMeta.length > 0 && (
+          <p className="text-xs text-white/35 mt-1 font-mono">
+            {progressMeta.join(" · ")}
+          </p>
         )}
       </div>
     </div>
