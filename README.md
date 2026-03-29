@@ -100,7 +100,11 @@ brew install ffmpeg whisper-cpp
 - 拖入多个文件或使用文件浏览器多选时，会自动进入批量处理模式。如果文件类型混合，会按最多的类型归组处理，同时提示被跳过的文件数量。
 - 批量处理中可以选择“处理完当前文件后停止”；点下后会立即进入“已请求停止”状态，当前文件完成后再收尾。完成页也支持“重试失败项”和“继续剩余项”。
 - 文件转换和转写都在本机完成，但首次安装依赖、下载模型这些恢复路径仍然需要联网。
-- Whisper 默认使用 `ggml-base.bin`。如果缺模型，界面里会直接给“下载模型”和“打开模型文件夹”的入口。
+- 转写默认推荐 `small + 自动检测`；如果当前只装了 `base`，界面会先回退到 `base` 继续可用，同时提示你升级到 `small`。
+- Whisper 缺模型时，界面会跟随当前选中的模型给出“下载模型”“从下载目录导入”“重新检测模型”和“打开模型文件夹”的入口，不会再把 `small` 误写成 `base`。
+- `ggml-base.bin`、`ggml-small.bin`、`ggml-medium.bin` 都是模型数据文件，不是可双击安装的程序；如果它们已经在 `Downloads` 里，直接点“从下载目录导入”即可。
+- 转写语言支持 `自动检测 / 中文 / English / Deutsch / Français / Español / 日本語 / 한국어`，`.txt / .srt / .vtt` 三种输出都会复用同一套模型和语言偏好。
+- “混合语种模式”默认关闭，并且只在“自动检测”下生效。它会先按停顿切段，再逐段检测语言并分别转写，最后用绝对时间轴合并成最终的 `.txt / .srt / .vtt`，更适合中德、中英这类长音频混合语种场景。
 - 当前主模型目录会跟随 bundle identifier 走到应用数据目录，也就是类似 `~/Library/Application Support/com.crashchen.forph/models/`。
 - 旧目录 `~/Library/Application Support/Forph/models/` 和 `~/Library/Application Support/com.forph.app/models/` 仍会被兼容读取，但不会自动清理。
 - 为了兼容从 Finder 直接启动的 GUI 环境，应用会优先尝试 Homebrew 常见路径，而不是只依赖终端里的 `PATH`。

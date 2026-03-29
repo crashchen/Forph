@@ -1,5 +1,13 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { FileText, Image, Music, Video, X } from "lucide-react";
+import {
+  ACTION_IDS,
+  imageActionIdFromOutputFormat,
+  imageOutputFormatFromActionId,
+  isImageActionId,
+  type ActionId,
+  type ImageOutputFormat,
+} from "../lib/actionIds";
 import type {
   FileAction,
   FileInfo,
@@ -12,6 +20,7 @@ import {
   exportMarkdown,
   extractAudio,
   getFileInfo,
+  importDownloadedModel,
   installDependency,
   transcribeAudio,
   videoToGif,
@@ -25,12 +34,23 @@ import {
 import { GifOptions } from "./GifOptions";
 import { CompressOptions } from "./CompressOptions";
 import { ImageOptions } from "./ImageOptions";
+import { TranscriptionPreferences } from "./TranscriptionPreferences";
 import { DependencySection, type InstallableDependency } from "./DependencySection";
+import {
+  loadTranscriptionPreferences,
+  modelFileName,
+  resolveEffectiveTranscriptionModel,
+  saveTranscriptionPreferences,
+  waitForModelAvailability,
+  type ModelImportState,
+  type TranscriptionLanguage,
+  type TranscriptionModel,
+} from "../lib/transcription";
 
 interface FileActionsProps {
   file: FileInfo;
   isDragOver: boolean;
-  onConversionStart: (actionId: string, jobId?: string) => void;
+  onConversionStart: (actionId: ActionId, jobId?: string) => void;
   onFileRefreshed: (sourcePath: string, file: FileInfo) => void;
   onResult: (result: ConversionResult) => void;
   onError: (error: string) => void;
@@ -43,6 +63,15 @@ const typeIcons: Record<string, typeof Image> = {
   video: Video,
   audio: Music,
 };
+
+const TRANSCRIPTION_ACTION_IDS = new Set<ActionId>([
+  ACTION_IDS.VID_TRANSCRIBE,
+  ACTION_IDS.AUD_TRANSCRIBE,
+  ACTION_IDS.VID_TRANSCRIBE_SRT,
+  ACTION_IDS.AUD_TRANSCRIBE_SRT,
+  ACTION_IDS.VID_TRANSCRIBE_VTT,
+  ACTION_IDS.AUD_TRANSCRIBE_VTT,
+]);
 
 function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo | null) {
   if (!media) return null;
@@ -65,7 +94,7 @@ function formatMediaSummary(fileType: FileInfo["file_type"], media?: MediaInfo |
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-function createJobId(actionId: string, filePath: string): string {
+function createJobId(actionId: ActionId, filePath: string): string {
   const suffix =
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -86,14 +115,34 @@ export function FileActions({
 }: FileActionsProps) {
   const [showGifOptions, setShowGifOptions] = useState(false);
   const [showCompressOptions, setShowCompressOptions] = useState(false);
-  const [imageOutputFormat, setImageOutputFormat] = useState<string | null>(null);
+  const [imageOutputFormat, setImageOutputFormat] =
+    useState<ImageOutputFormat | null>(null);
+  const [preferredModel, setPreferredModel] = useState<TranscriptionModel>(
+    () => loadTranscriptionPreferences().preferredModel,
+  );
+  const [preferredLanguage, setPreferredLanguage] = useState<TranscriptionLanguage>(
+    () => loadTranscriptionPreferences().preferredLanguage,
+  );
+  const [preferMixedLanguageMode, setPreferMixedLanguageMode] =
+    useState<boolean>(() => loadTranscriptionPreferences().preferMixedLanguageMode);
   const [installingDependency, setInstallingDependency] =
     useState<InstallableDependency | null>(null);
+  const [modelImportState, setModelImportState] =
+    useState<ModelImportState>("idle");
   const [dependencyMessage, setDependencyMessage] = useState<string | null>(null);
   const [dependencyError, setDependencyError] = useState<string | null>(null);
   const Icon = typeIcons[file.file_type] || FileText;
   const runtime = file.runtime;
   const mediaSummary = formatMediaSummary(file.file_type, file.media);
+  const resolvedModel = useMemo(
+    () => resolveEffectiveTranscriptionModel(runtime, preferredModel),
+    [runtime, preferredModel],
+  );
+  const effectiveModel = resolvedModel.effectiveModel;
+  const hasTranscriptionActions = useMemo(
+    () => file.actions.some((action) => TRANSCRIPTION_ACTION_IDS.has(action.id)),
+    [file.actions],
+  );
   const activeFilePathRef = useRef(file.path);
   const installRequestIdRef = useRef(0);
   const isMountedRef = useRef(true);
@@ -111,9 +160,73 @@ export function FileActions({
     setShowCompressOptions(false);
     setImageOutputFormat(null);
     setInstallingDependency(null);
+    setModelImportState("idle");
     setDependencyMessage(null);
     setDependencyError(null);
   }, [file.path]);
+
+  useEffect(() => {
+    saveTranscriptionPreferences({
+      preferredModel,
+      preferredLanguage,
+      preferMixedLanguageMode,
+    });
+  }, [preferMixedLanguageMode, preferredLanguage, preferredModel]);
+
+  useEffect(() => {
+    installRequestIdRef.current += 1;
+    setModelImportState("idle");
+    setDependencyMessage(null);
+    setDependencyError(null);
+  }, [preferredModel]);
+
+  const refreshCurrentFileForModel = useCallback(
+    async (
+      sourcePath: string,
+      requestId: number,
+      expectedModel: TranscriptionModel,
+      refreshMessage: string,
+    ): Promise<"ready" | "stale"> => {
+      setModelImportState("refreshing");
+      setDependencyMessage(refreshMessage);
+
+      const refreshResult = await waitForModelAvailability(sourcePath, expectedModel, {
+        attempts: 8,
+        delayMs: 250,
+        shouldContinue: () =>
+          isMountedRef.current &&
+          installRequestIdRef.current === requestId &&
+          activeFilePathRef.current === sourcePath,
+      });
+
+      if (
+        !isMountedRef.current ||
+        installRequestIdRef.current !== requestId ||
+        activeFilePathRef.current !== sourcePath
+      ) {
+        return "stale";
+      }
+
+      if (refreshResult.file) {
+        onFileRefreshed(sourcePath, refreshResult.file);
+      }
+
+      if (refreshResult.status === "ready" && refreshResult.file) {
+        setModelImportState("success");
+        setDependencyMessage(
+          `${modelFileName(expectedModel)} 已就绪，当前文件的转写动作已经刷新。`,
+        );
+        return "ready";
+      }
+
+      setModelImportState("stale");
+      setDependencyMessage(
+        `${modelFileName(expectedModel)} 已复制到模型目录，但当前还没完成识别。可以点“重新检测模型”再试一次。`,
+      );
+      return "stale";
+    },
+    [onFileRefreshed],
+  );
 
   const executeAction = useCallback(
     async (action: FileAction) => {
@@ -124,27 +237,48 @@ export function FileActions({
       try {
         let result: ConversionResult;
 
-        if (action.id === "md_html") {
+        if (action.id === ACTION_IDS.MD_HTML) {
           result = await exportMarkdown(file.path);
-        } else if (action.id === "vid_mp3" || action.id === "aud_mp3") {
+        } else if (action.id === ACTION_IDS.VID_MP3 || action.id === ACTION_IDS.AUD_MP3) {
           result = await extractAudio(file.path, "mp3", jobId);
-        } else if (action.id === "vid_wav" || action.id === "aud_wav") {
+        } else if (action.id === ACTION_IDS.VID_WAV || action.id === ACTION_IDS.AUD_WAV) {
           result = await extractAudio(file.path, "wav", jobId);
         } else if (
-          action.id === "vid_transcribe" ||
-          action.id === "aud_transcribe"
+          action.id === ACTION_IDS.VID_TRANSCRIBE ||
+          action.id === ACTION_IDS.AUD_TRANSCRIBE
         ) {
-          result = await transcribeAudio(file.path, "base", undefined, undefined, jobId);
+          result = await transcribeAudio(
+            file.path,
+            effectiveModel ?? preferredModel,
+            preferredLanguage,
+            undefined,
+            jobId,
+            preferMixedLanguageMode,
+          );
         } else if (
-          action.id === "vid_transcribe_srt" ||
-          action.id === "aud_transcribe_srt"
+          action.id === ACTION_IDS.VID_TRANSCRIBE_SRT ||
+          action.id === ACTION_IDS.AUD_TRANSCRIBE_SRT
         ) {
-          result = await transcribeAudio(file.path, "base", undefined, "srt", jobId);
+          result = await transcribeAudio(
+            file.path,
+            effectiveModel ?? preferredModel,
+            preferredLanguage,
+            "srt",
+            jobId,
+            preferMixedLanguageMode,
+          );
         } else if (
-          action.id === "vid_transcribe_vtt" ||
-          action.id === "aud_transcribe_vtt"
+          action.id === ACTION_IDS.VID_TRANSCRIBE_VTT ||
+          action.id === ACTION_IDS.AUD_TRANSCRIBE_VTT
         ) {
-          result = await transcribeAudio(file.path, "base", undefined, "vtt", jobId);
+          result = await transcribeAudio(
+            file.path,
+            effectiveModel ?? preferredModel,
+            preferredLanguage,
+            "vtt",
+            jobId,
+            preferMixedLanguageMode,
+          );
         } else {
           throw new Error(`未知操作: ${action.id}`);
         }
@@ -153,13 +287,22 @@ export function FileActions({
         onError(getErrorMessage(error, "转换失败"));
       }
     },
-    [file, onConversionStart, onResult, onError],
+    [
+      effectiveModel,
+      file,
+      onConversionStart,
+      onError,
+      onResult,
+      preferMixedLanguageMode,
+      preferredLanguage,
+      preferredModel,
+    ],
   );
 
   const handleImageConvert = useCallback(
     async (quality?: number) => {
       if (!imageOutputFormat) return;
-      const actionId = `img_${imageOutputFormat}`;
+      const actionId = imageActionIdFromOutputFormat(imageOutputFormat);
       onConversionStart(actionId);
       try {
         const result = await convertImage(file.path, imageOutputFormat, quality);
@@ -224,10 +367,74 @@ export function FileActions({
     [file.path, onFileRefreshed],
   );
 
+  const handleModelImport = useCallback(async () => {
+    const sourcePath = file.path;
+    const expectedModel = preferredModel;
+    const requestId = installRequestIdRef.current + 1;
+    installRequestIdRef.current = requestId;
+    setDependencyMessage(null);
+    setDependencyError(null);
+    setModelImportState("importing");
+
+    try {
+      const result = await importDownloadedModel(expectedModel);
+      if (
+        !isMountedRef.current ||
+        installRequestIdRef.current !== requestId ||
+        activeFilePathRef.current !== sourcePath
+      ) {
+        return;
+      }
+
+      setDependencyMessage(result.message);
+      await refreshCurrentFileForModel(
+        sourcePath,
+        requestId,
+        expectedModel,
+        `已导入 ${modelFileName(expectedModel)}，正在刷新模型状态...`,
+      );
+    } catch (error) {
+      if (
+        !isMountedRef.current ||
+        installRequestIdRef.current !== requestId ||
+        activeFilePathRef.current !== sourcePath
+      ) {
+        return;
+      }
+
+      setDependencyError(getErrorMessage(error, "自动导入模型失败"));
+      setModelImportState("idle");
+    } finally {
+      if (
+        isMountedRef.current &&
+        installRequestIdRef.current === requestId &&
+        activeFilePathRef.current === sourcePath &&
+        modelImportState === "importing"
+      ) {
+        setModelImportState("idle");
+      }
+    }
+  }, [file.path, modelImportState, preferredModel, refreshCurrentFileForModel]);
+
+  const handleRetryModelDetection = useCallback(async () => {
+    const sourcePath = file.path;
+    const expectedModel = preferredModel;
+    const requestId = installRequestIdRef.current + 1;
+    installRequestIdRef.current = requestId;
+    setDependencyError(null);
+
+    await refreshCurrentFileForModel(
+      sourcePath,
+      requestId,
+      expectedModel,
+      `正在重新检测 ${modelFileName(expectedModel)}...`,
+    );
+  }, [file.path, preferredModel, refreshCurrentFileForModel]);
+
   const handleCompress = useCallback(
     async (quality: string, maxResolution?: string) => {
-      const jobId = createJobId("vid_compress", file.path);
-      onConversionStart("vid_compress", jobId);
+      const jobId = createJobId(ACTION_IDS.VID_COMPRESS, file.path);
+      onConversionStart(ACTION_IDS.VID_COMPRESS, jobId);
       try {
         const result = await compressVideo(file.path, quality, maxResolution, jobId);
         onResult(result);
@@ -245,8 +452,8 @@ export function FileActions({
       startTime: number,
       duration: number,
     ) => {
-      const jobId = createJobId("vid_gif", file.path);
-      onConversionStart("vid_gif", jobId);
+      const jobId = createJobId(ACTION_IDS.VID_GIF, file.path);
+      onConversionStart(ACTION_IDS.VID_GIF, jobId);
       try {
         const result = await videoToGif(
           file.path,
@@ -313,22 +520,22 @@ export function FileActions({
               const disabled = Boolean(disabledReason);
 
               const hasOptionsPanel =
-                action.id === "vid_gif" ||
-                action.id === "vid_compress" ||
-                action.id.startsWith("img_");
+                action.id === ACTION_IDS.VID_GIF ||
+                action.id === ACTION_IDS.VID_COMPRESS ||
+                isImageActionId(action.id);
 
               if (hasOptionsPanel) {
                 const togglePanel = () => {
-                  if (action.id === "vid_gif") {
+                  if (action.id === ACTION_IDS.VID_GIF) {
                     setShowGifOptions((v) => !v);
                     setShowCompressOptions(false);
                     setImageOutputFormat(null);
-                  } else if (action.id === "vid_compress") {
+                  } else if (action.id === ACTION_IDS.VID_COMPRESS) {
                     setShowCompressOptions((v) => !v);
                     setShowGifOptions(false);
                     setImageOutputFormat(null);
-                  } else {
-                    const fmt = action.id.replace("img_", "");
+                  } else if (isImageActionId(action.id)) {
+                    const fmt = imageOutputFormatFromActionId(action.id);
                     setImageOutputFormat((v) => (v === fmt ? null : fmt));
                     setShowGifOptions(false);
                     setShowCompressOptions(false);
@@ -380,13 +587,35 @@ export function FileActions({
         />
       )}
 
+      {runtime && hasTranscriptionActions && (
+        <TranscriptionPreferences
+          runtime={runtime}
+          selectedModel={preferredModel}
+          effectiveModel={effectiveModel}
+          selectedLanguage={preferredLanguage}
+          preferMixedLanguageMode={preferMixedLanguageMode}
+          onModelChange={setPreferredModel}
+          onLanguageChange={setPreferredLanguage}
+          onMixedLanguageModeChange={setPreferMixedLanguageMode}
+        />
+      )}
+
       {runtime && (
         <DependencySection
           runtime={runtime}
           installingDependency={installingDependency}
+          modelImportState={modelImportState}
+          selectedModel={preferredModel}
+          effectiveModel={effectiveModel}
           dependencyMessage={dependencyMessage}
           dependencyError={dependencyError}
           onInstallDependency={handleDependencyInstall}
+          onImportDownloadedModel={() => {
+            void handleModelImport();
+          }}
+          onRetryModelDetection={() => {
+            void handleRetryModelDetection();
+          }}
         />
       )}
 

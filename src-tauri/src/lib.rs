@@ -62,6 +62,14 @@ pub struct DependencyInstallResult {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct ModelImportResult {
+    model_name: String,
+    source_path: String,
+    target_path: String,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ConversionResult {
     output_path: String,
     output_size: u64,
@@ -115,9 +123,36 @@ enum FfmpegProgressUpdate {
     End,
 }
 
+#[derive(Debug, PartialEq)]
+enum ValidatedOpenTarget {
+    Url(String),
+    Path(PathBuf),
+}
+
 struct StreamCommandOutput {
     status: ExitStatus,
     stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpeechSegment {
+    absolute_start_ms: u64,
+    absolute_end_ms: u64,
+    duration_ms: u64,
+    detected_language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SilenceEvent {
+    Start(u64),
+    End(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleCue {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -126,6 +161,12 @@ struct ProgressReporter {
     job_id: Option<String>,
     file_path: String,
 }
+
+const MIXED_LANGUAGE_PADDING_MS: u64 = 200;
+const MIXED_LANGUAGE_MAX_SEGMENT_MS: u64 = 8_000;
+const MIXED_LANGUAGE_MIN_SEGMENT_MS: u64 = 1_500;
+const MIXED_LANGUAGE_SILENCE_DURATION_SECONDS: f64 = 0.35;
+const MIXED_LANGUAGE_SILENCE_THRESHOLD: &str = "-35dB";
 
 impl ProgressReporter {
     fn new(app: AppHandle, job_id: Option<String>, file_path: String) -> Self {
@@ -247,6 +288,10 @@ fn application_support_dir() -> PathBuf {
     home_dir().join("Library/Application Support")
 }
 
+fn downloads_dir() -> PathBuf {
+    home_dir().join("Downloads")
+}
+
 fn preferred_model_directory(app: &AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()
@@ -285,6 +330,41 @@ fn available_models_in_directory(dir: &Path) -> Vec<String> {
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter_map(|name| parse_model_name(&name))
         .collect()
+}
+
+fn find_downloaded_model_candidate_in_dir(dir: &Path, model_name: &str) -> Option<PathBuf> {
+    let exact_name = format!("ggml-{}.bin", model_name);
+    let prefix = format!("ggml-{}", model_name);
+
+    let entries = std::fs::read_dir(dir).ok()?;
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let is_match = file_name == exact_name
+                || (file_name.starts_with(&prefix) && file_name.ends_with(".bin"));
+            if !is_match || !path.is_file() {
+                return None;
+            }
+
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, path)| {
+            (
+                modified.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                path.file_name()
+                    .map(|name| name.to_os_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .map(|(_, path)| path)
 }
 
 fn inspect_models(app: &AppHandle, requested_model: &str) -> ModelLookup {
@@ -361,6 +441,24 @@ fn parse_optional_f64(value: Option<&str>) -> Option<f64> {
 
 fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
     value.and_then(|v| v.parse::<u32>().ok())
+}
+
+fn normalized_transcription_language(language: Option<String>) -> Result<String, String> {
+    let normalized = language
+        .unwrap_or_else(|| "auto".into())
+        .trim()
+        .to_lowercase();
+
+    let normalized = if normalized.is_empty() {
+        "auto".to_string()
+    } else {
+        normalized
+    };
+
+    match normalized.as_str() {
+        "auto" | "zh" | "en" | "de" | "fr" | "es" | "ja" | "ko" => Ok(normalized),
+        _ => Err("不支持的转写语言。".into()),
+    }
 }
 
 fn round_duration(value: f64) -> f64 {
@@ -629,6 +727,7 @@ fn strip_frontmatter(content: &str) -> &str {
 }
 
 fn build_markdown_document(title: &str, html_body: &str) -> String {
+    let escaped_title = escape_html_text(title);
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -644,7 +743,7 @@ fn build_markdown_document(title: &str, html_body: &str) -> String {
 </article>
 </body>
 </html>"#,
-        title,
+        escaped_title,
         markdown_css(),
         html_body
     )
@@ -697,8 +796,107 @@ fn save_image_with_quality(
     Ok(())
 }
 
-fn is_probably_url(target: &str) -> bool {
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn is_trusted_open_url(target: &str) -> bool {
+    matches!(target, "https://brew.sh" | "https://brew.sh/")
+        || target.starts_with("https://huggingface.co/")
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("只能打开本地绝对路径。".into());
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+            std::path::Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err("只能打开本地绝对路径。".into());
+                }
+            }
+            std::path::Component::Prefix(_) => {
+                return Err("只能打开本地绝对路径。".into());
+            }
+        }
+    }
+
+    let mut normalized = PathBuf::from("/");
+    for part in parts {
+        normalized.push(part);
+    }
+    Ok(normalized)
+}
+
+fn validate_existing_local_target(target: &str) -> Result<PathBuf, String> {
+    if target.trim().is_empty() {
+        return Err("目标不能为空。".into());
+    }
+    if is_http_url(target.trim()) {
+        return Err("只允许打开受信任的下载地址。".into());
+    }
+
+    let normalized = normalize_absolute_path(Path::new(target))?;
+    if !normalized.exists() {
+        return Err("只能打开已存在的本地路径。".into());
+    }
+
+    normalized
+        .canonicalize()
+        .map_err(|error| format!("无法解析路径: {}", error))
+}
+
+fn validate_open_target_request(
+    target: &str,
+    ensure_directory: bool,
+    allowed_model_directory: &Path,
+) -> Result<ValidatedOpenTarget, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("目标不能为空。".into());
+    }
+
+    if is_http_url(trimmed) {
+        if ensure_directory {
+            return Err("模型目录只能是本地绝对路径。".into());
+        }
+        if !is_trusted_open_url(trimmed) {
+            return Err("只允许打开受信任的下载地址。".into());
+        }
+        return Ok(ValidatedOpenTarget::Url(trimmed.to_string()));
+    }
+
+    let normalized = normalize_absolute_path(Path::new(target))?;
+    if ensure_directory {
+        let allowed = normalize_absolute_path(allowed_model_directory)?;
+        if normalized != allowed {
+            return Err("模型目录以外的路径不允许自动创建。".into());
+        }
+        return Ok(ValidatedOpenTarget::Path(normalized));
+    }
+
+    Ok(ValidatedOpenTarget::Path(validate_existing_local_target(trimmed)?))
 }
 
 fn dependency_is_installed(package_name: &str) -> bool {
@@ -1036,6 +1234,823 @@ fn run_whisper_with_progress(
     }
 
     Ok(output.stderr)
+}
+
+fn speech_segment(start_ms: u64, end_ms: u64) -> Option<SpeechSegment> {
+    (end_ms > start_ms).then(|| SpeechSegment {
+        absolute_start_ms: start_ms,
+        absolute_end_ms: end_ms,
+        duration_ms: end_ms - start_ms,
+        detected_language: None,
+    })
+}
+
+fn seconds_to_millis(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+
+    (seconds * 1000.0).round() as u64
+}
+
+fn millis_to_seconds(milliseconds: u64) -> f64 {
+    milliseconds as f64 / 1000.0
+}
+
+fn build_whisper_args(
+    model_path: &Path,
+    input_wav: &Path,
+    output_flag: &str,
+    output_base: &Path,
+    language: &str,
+    disable_context: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-pp".to_string(),
+        "-m".to_string(),
+        model_path.to_string_lossy().to_string(),
+        "-f".into(),
+        input_wav.to_string_lossy().to_string(),
+    ];
+
+    if disable_context {
+        args.extend(["-mc".into(), "0".into()]);
+    }
+
+    args.extend([
+        output_flag.into(),
+        "-of".into(),
+        output_base.to_string_lossy().to_string(),
+        "-l".into(),
+        language.to_string(),
+    ]);
+
+    args
+}
+
+fn build_whisper_language_detection_args(model_path: &Path, input_wav: &Path) -> Vec<String> {
+    vec![
+        "-dl".to_string(),
+        "-m".to_string(),
+        model_path.to_string_lossy().to_string(),
+        "-f".into(),
+        input_wav.to_string_lossy().to_string(),
+        "-l".into(),
+        "auto".into(),
+    ]
+}
+
+fn unique_temp_directory(prefix: &str) -> Result<PathBuf, String> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("无法生成临时目录名: {}", error))?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&path).map_err(|error| format!("无法创建临时目录: {}", error))?;
+    Ok(path)
+}
+
+fn normalize_text_lines(content: &str) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn parse_timestamp_ms(value: &str) -> Option<u64> {
+    let normalized = value.trim().replace(',', ".");
+    let parts = normalized.split(':').collect::<Vec<_>>();
+    let (hours, minutes, seconds_part) = match parts.as_slice() {
+        [hours, minutes, seconds_part] => (*hours, *minutes, *seconds_part),
+        [minutes, seconds_part] => ("0", *minutes, *seconds_part),
+        _ => return None,
+    };
+
+    let (seconds, milliseconds) = seconds_part.split_once('.')?;
+    let hours = hours.parse::<u64>().ok()?;
+    let minutes = minutes.parse::<u64>().ok()?;
+    let seconds = seconds.parse::<u64>().ok()?;
+    let milliseconds = match milliseconds.len() {
+        0 => 0,
+        1 => milliseconds.parse::<u64>().ok()? * 100,
+        2 => milliseconds.parse::<u64>().ok()? * 10,
+        _ => milliseconds[..3].parse::<u64>().ok()?,
+    };
+
+    Some((hours * 3_600_000) + (minutes * 60_000) + (seconds * 1_000) + milliseconds)
+}
+
+fn format_srt_timestamp(milliseconds: u64) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = (milliseconds % 3_600_000) / 60_000;
+    let seconds = (milliseconds % 60_000) / 1_000;
+    let millis = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
+}
+
+fn format_vtt_timestamp(milliseconds: u64) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = (milliseconds % 3_600_000) / 60_000;
+    let seconds = (milliseconds % 60_000) / 1_000;
+    let millis = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn parse_timestamp_range(line: &str) -> Option<(u64, u64)> {
+    let (start, end) = line.split_once("-->")?;
+    let end_token = end.trim().split_whitespace().next()?;
+    Some((parse_timestamp_ms(start.trim())?, parse_timestamp_ms(end_token)?))
+}
+
+fn parse_srt_cues(content: &str) -> Vec<SubtitleCue> {
+    let normalized = normalize_text_lines(content);
+    let mut cues = Vec::new();
+
+    for block in normalized.split("\n\n") {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut lines = trimmed.lines();
+        let first_line = lines.next().unwrap_or_default().trim();
+        let timestamp_line = if first_line.contains("-->") {
+            first_line
+        } else {
+            lines.next().unwrap_or_default().trim()
+        };
+
+        let Some((start_ms, end_ms)) = parse_timestamp_range(timestamp_line) else {
+            continue;
+        };
+
+        let text = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        cues.push(SubtitleCue {
+            start_ms,
+            end_ms,
+            text,
+        });
+    }
+
+    cues
+}
+
+fn parse_vtt_cues(content: &str) -> Vec<SubtitleCue> {
+    let normalized = normalize_text_lines(content);
+    let normalized = normalized.trim_start_matches('\u{feff}');
+    let body = if normalized.trim_start().starts_with("WEBVTT") {
+        normalized
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        normalized.to_string()
+    };
+
+    let mut cues = Vec::new();
+    for block in body.split("\n\n") {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let lines = trimmed.lines().collect::<Vec<_>>();
+        let timestamp_index = lines.iter().position(|line| line.contains("-->"));
+        let Some(timestamp_index) = timestamp_index else {
+            continue;
+        };
+
+        let Some((start_ms, end_ms)) = parse_timestamp_range(lines[timestamp_index].trim()) else {
+            continue;
+        };
+
+        let text = lines[(timestamp_index + 1)..].join("\n").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        cues.push(SubtitleCue {
+            start_ms,
+            end_ms,
+            text,
+        });
+    }
+
+    cues
+}
+
+fn serialize_srt_cues(cues: &[SubtitleCue]) -> String {
+    if cues.is_empty() {
+        return String::new();
+    }
+
+    let blocks = cues
+        .iter()
+        .enumerate()
+        .map(|(index, cue)| {
+            format!(
+                "{}\n{} --> {}\n{}",
+                index + 1,
+                format_srt_timestamp(cue.start_ms),
+                format_srt_timestamp(cue.end_ms.max(cue.start_ms)),
+                cue.text
+            )
+        })
+        .collect::<Vec<_>>();
+
+    format!("{}\n", blocks.join("\n\n"))
+}
+
+fn serialize_vtt_cues(cues: &[SubtitleCue]) -> String {
+    if cues.is_empty() {
+        return "WEBVTT\n".to_string();
+    }
+
+    let blocks = cues
+        .iter()
+        .map(|cue| {
+            format!(
+                "{} --> {}\n{}",
+                format_vtt_timestamp(cue.start_ms),
+                format_vtt_timestamp(cue.end_ms.max(cue.start_ms)),
+                cue.text
+            )
+        })
+        .collect::<Vec<_>>();
+
+    format!("WEBVTT\n\n{}\n", blocks.join("\n\n"))
+}
+
+fn merge_txt_outputs(outputs: &[(SpeechSegment, PathBuf)]) -> Result<String, String> {
+    let mut blocks = Vec::new();
+
+    for (_, path) in outputs {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("读取分段转写结果失败: {}", error))?;
+        let trimmed = normalize_text_lines(&content).trim().to_string();
+        if !trimmed.is_empty() {
+            blocks.push(trimmed);
+        }
+    }
+
+    Ok(if blocks.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", blocks.join("\n\n"))
+    })
+}
+
+fn merge_srt_outputs(
+    outputs: &[(SpeechSegment, PathBuf)],
+    total_duration_ms: u64,
+) -> Result<String, String> {
+    let mut cues = Vec::new();
+
+    for (segment, path) in outputs {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("读取分段字幕结果失败: {}", error))?;
+        for cue in parse_srt_cues(&content) {
+            let local_start = cue.start_ms.min(segment.duration_ms);
+            let local_end = cue.end_ms.min(segment.duration_ms).max(local_start);
+            let global_start = (segment.absolute_start_ms + local_start).min(total_duration_ms);
+            let global_end = (segment.absolute_start_ms + local_end)
+                .min(total_duration_ms)
+                .max(global_start);
+            cues.push(SubtitleCue {
+                start_ms: global_start,
+                end_ms: global_end,
+                text: cue.text,
+            });
+        }
+    }
+
+    cues.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.text.cmp(&b.text))
+    });
+
+    Ok(serialize_srt_cues(&cues))
+}
+
+fn merge_vtt_outputs(
+    outputs: &[(SpeechSegment, PathBuf)],
+    total_duration_ms: u64,
+) -> Result<String, String> {
+    let mut cues = Vec::new();
+
+    for (segment, path) in outputs {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("读取分段字幕结果失败: {}", error))?;
+        for cue in parse_vtt_cues(&content) {
+            let local_start = cue.start_ms.min(segment.duration_ms);
+            let local_end = cue.end_ms.min(segment.duration_ms).max(local_start);
+            let global_start = (segment.absolute_start_ms + local_start).min(total_duration_ms);
+            let global_end = (segment.absolute_start_ms + local_end)
+                .min(total_duration_ms)
+                .max(global_start);
+            cues.push(SubtitleCue {
+                start_ms: global_start,
+                end_ms: global_end,
+                text: cue.text,
+            });
+        }
+    }
+
+    cues.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(a.text.cmp(&b.text))
+    });
+
+    Ok(serialize_vtt_cues(&cues))
+}
+
+fn merge_transcription_chunk_outputs(
+    outputs: &[(SpeechSegment, PathBuf)],
+    format: &str,
+    total_duration_ms: u64,
+) -> Result<String, String> {
+    match format {
+        "srt" => merge_srt_outputs(outputs, total_duration_ms),
+        "vtt" => merge_vtt_outputs(outputs, total_duration_ms),
+        _ => merge_txt_outputs(outputs),
+    }
+}
+
+fn normalize_detected_language_label(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "zh" | "chinese" | "mandarin" => Some("zh".into()),
+        "en" | "english" => Some("en".into()),
+        "de" | "german" | "deutsch" => Some("de".into()),
+        "fr" | "french" | "francais" | "français" => Some("fr".into()),
+        "es" | "spanish" | "espanol" | "español" => Some("es".into()),
+        "ja" | "japanese" => Some("ja".into()),
+        "ko" | "korean" => Some("ko".into()),
+        _ => None,
+    }
+}
+
+fn parse_detected_language(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lowercase = line.to_ascii_lowercase();
+        if !lowercase.contains("language") {
+            continue;
+        }
+
+        for token in lowercase.split(|ch: char| !ch.is_alphanumeric() && ch != '-') {
+            if token.is_empty() {
+                continue;
+            }
+
+            if let Some(language) = normalize_detected_language_label(token) {
+                return Some(language);
+            }
+        }
+    }
+
+    None
+}
+
+fn display_language_label(language: &str) -> &str {
+    match language {
+        "zh" => "中文",
+        "en" => "English",
+        "de" => "Deutsch",
+        "fr" => "Français",
+        "es" => "Español",
+        "ja" => "日本語",
+        "ko" => "한국어",
+        _ => "自动检测",
+    }
+}
+
+fn run_whisper_language_detection(
+    whisper_cmd: &Path,
+    model_path: &Path,
+    input_wav: &Path,
+) -> Result<Option<String>, String> {
+    let output = command_with_augmented_path(whisper_cmd)
+        .args(build_whisper_language_detection_args(model_path, input_wav))
+        .output()
+        .map_err(|error| format!("语言检测命令执行失败: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}\n{stderr}");
+
+    if !output.status.success() {
+        let details = combined.trim();
+        return Err(if details.is_empty() {
+            "语言检测失败".into()
+        } else {
+            format!("语言检测失败: {}", details)
+        });
+    }
+
+    Ok(parse_detected_language(&combined))
+}
+
+fn parse_silencedetect_event_line(line: &str) -> Option<SilenceEvent> {
+    if let Some((_, value)) = line.split_once("silence_start:") {
+        let seconds = value.trim().split_whitespace().next()?.parse::<f64>().ok()?;
+        return Some(SilenceEvent::Start(seconds_to_millis(seconds)));
+    }
+
+    if let Some((_, value)) = line.split_once("silence_end:") {
+        let seconds = value.trim().split_whitespace().next()?.parse::<f64>().ok()?;
+        return Some(SilenceEvent::End(seconds_to_millis(seconds)));
+    }
+
+    None
+}
+
+fn build_speech_segments_from_silence_events(
+    events: &[SilenceEvent],
+    total_duration_ms: u64,
+) -> Vec<SpeechSegment> {
+    let mut segments = Vec::new();
+    let mut next_speech_start_ms = 0_u64;
+    let mut in_silence = false;
+
+    for event in events {
+        match *event {
+            SilenceEvent::Start(silence_start_ms) => {
+                if let Some(segment) =
+                    speech_segment(next_speech_start_ms, silence_start_ms.min(total_duration_ms))
+                {
+                    segments.push(segment);
+                }
+                next_speech_start_ms = silence_start_ms.min(total_duration_ms);
+                in_silence = true;
+            }
+            SilenceEvent::End(silence_end_ms) => {
+                next_speech_start_ms = silence_end_ms.min(total_duration_ms);
+                in_silence = false;
+            }
+        }
+    }
+
+    if !in_silence {
+        if let Some(segment) = speech_segment(next_speech_start_ms, total_duration_ms) {
+            segments.push(segment);
+        }
+    }
+
+    segments
+}
+
+fn apply_padding_to_segments(
+    segments: Vec<SpeechSegment>,
+    total_duration_ms: u64,
+    padding_ms: u64,
+) -> Vec<SpeechSegment> {
+    segments
+        .into_iter()
+        .filter_map(|segment| {
+            speech_segment(
+                segment.absolute_start_ms.saturating_sub(padding_ms),
+                (segment.absolute_end_ms + padding_ms).min(total_duration_ms),
+            )
+        })
+        .collect()
+}
+
+fn merge_overlapping_segments(segments: Vec<SpeechSegment>) -> Vec<SpeechSegment> {
+    let mut iter = segments.into_iter();
+    let Some(mut current) = iter.next() else {
+        return Vec::new();
+    };
+
+    let mut merged = Vec::new();
+    for segment in iter {
+        if segment.absolute_start_ms <= current.absolute_end_ms {
+            current.absolute_end_ms = current.absolute_end_ms.max(segment.absolute_end_ms);
+            current.duration_ms = current.absolute_end_ms - current.absolute_start_ms;
+            continue;
+        }
+
+        merged.push(current);
+        current = segment;
+    }
+    merged.push(current);
+    merged
+}
+
+fn split_long_segments(segments: Vec<SpeechSegment>, max_segment_ms: u64) -> Vec<SpeechSegment> {
+    let mut split_segments = Vec::new();
+
+    for segment in segments {
+        let mut start_ms = segment.absolute_start_ms;
+        while start_ms < segment.absolute_end_ms {
+            let end_ms = (start_ms + max_segment_ms).min(segment.absolute_end_ms);
+            if let Some(chunk) = speech_segment(start_ms, end_ms) {
+                split_segments.push(chunk);
+            }
+            start_ms = end_ms;
+        }
+    }
+
+    split_segments
+}
+
+fn merge_short_segments(
+    segments: Vec<SpeechSegment>,
+    min_segment_ms: u64,
+    max_segment_ms: u64,
+) -> Vec<SpeechSegment> {
+    if segments.is_empty() {
+        return segments;
+    }
+
+    let mut forward_merged = Vec::new();
+    let mut index = 0;
+    while index < segments.len() {
+        let mut current = segments[index].clone();
+
+        while current.duration_ms < min_segment_ms && index + 1 < segments.len() {
+            let next = &segments[index + 1];
+            if next.absolute_end_ms.saturating_sub(current.absolute_start_ms) > max_segment_ms {
+                break;
+            }
+
+            current.absolute_end_ms = next.absolute_end_ms;
+            current.duration_ms = current.absolute_end_ms - current.absolute_start_ms;
+            index += 1;
+        }
+
+        forward_merged.push(current);
+        index += 1;
+    }
+
+    let mut collapsed: Vec<SpeechSegment> = Vec::new();
+    for segment in forward_merged {
+        if let Some(last) = collapsed.last_mut() {
+            if segment.duration_ms < min_segment_ms
+                && segment.absolute_end_ms.saturating_sub(last.absolute_start_ms)
+                    <= max_segment_ms
+            {
+                last.absolute_end_ms = segment.absolute_end_ms;
+                last.duration_ms = last.absolute_end_ms - last.absolute_start_ms;
+                continue;
+            }
+        }
+
+        collapsed.push(segment);
+    }
+
+    collapsed
+}
+
+fn normalize_speech_segments(
+    raw_segments: Vec<SpeechSegment>,
+    total_duration_ms: u64,
+) -> Vec<SpeechSegment> {
+    let padded = apply_padding_to_segments(raw_segments, total_duration_ms, MIXED_LANGUAGE_PADDING_MS);
+    let merged = merge_overlapping_segments(padded);
+    let split = split_long_segments(merged, MIXED_LANGUAGE_MAX_SEGMENT_MS);
+    merge_short_segments(split, MIXED_LANGUAGE_MIN_SEGMENT_MS, MIXED_LANGUAGE_MAX_SEGMENT_MS)
+}
+
+fn detect_speech_segments(
+    ffmpeg: &Path,
+    input_wav: &Path,
+    total_duration_ms: u64,
+) -> Result<Vec<SpeechSegment>, String> {
+    if total_duration_ms == 0 {
+        return Ok(Vec::new());
+    }
+
+    let silence_filter = format!(
+        "silencedetect=noise={}:d={}",
+        MIXED_LANGUAGE_SILENCE_THRESHOLD, MIXED_LANGUAGE_SILENCE_DURATION_SECONDS
+    );
+    let output = command_with_augmented_path(ffmpeg)
+        .args(vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "info".into(),
+            "-nostats".into(),
+            "-i".into(),
+            input_wav.to_string_lossy().to_string(),
+            "-af".into(),
+            silence_filter,
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ])
+        .output();
+
+    let raw_segments = match output {
+        Ok(result) if result.status.success() => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let events = stderr
+                .lines()
+                .filter_map(parse_silencedetect_event_line)
+                .collect::<Vec<_>>();
+            let derived = build_speech_segments_from_silence_events(&events, total_duration_ms);
+            if derived.is_empty() {
+                speech_segment(0, total_duration_ms).into_iter().collect()
+            } else {
+                derived
+            }
+        }
+        _ => speech_segment(0, total_duration_ms).into_iter().collect(),
+    };
+
+    Ok(normalize_speech_segments(raw_segments, total_duration_ms))
+}
+
+fn extract_segment_audio(
+    ffmpeg: &Path,
+    input_wav: &Path,
+    output_wav: &Path,
+    segment: &SpeechSegment,
+) -> Result<(), String> {
+    let duration_seconds = millis_to_seconds(segment.duration_ms);
+    let start_seconds = millis_to_seconds(segment.absolute_start_ms);
+    let output = command_with_augmented_path(ffmpeg)
+        .args(vec![
+            "-y".into(),
+            "-ss".into(),
+            format!("{start_seconds:.3}"),
+            "-t".into(),
+            format!("{duration_seconds:.3}"),
+            "-i".into(),
+            input_wav.to_string_lossy().to_string(),
+            "-ar".into(),
+            "16000".into(),
+            "-ac".into(),
+            "1".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+            output_wav.to_string_lossy().to_string(),
+        ])
+        .output()
+        .map_err(|error| format!("切出音频片段失败: {}", error))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "切出音频片段失败".into()
+        } else {
+            format!("切出音频片段失败: {}", details)
+        });
+    }
+
+    Ok(())
+}
+
+fn run_mixed_language_transcription(
+    reporter: &ProgressReporter,
+    ffmpeg: &Path,
+    whisper_cmd: &Path,
+    model_path: &Path,
+    input_wav: &Path,
+    output_flag: &str,
+    format: &str,
+    output_path: &Path,
+    total_duration_seconds: f64,
+) -> Result<(), String> {
+    let total_duration_ms = seconds_to_millis(total_duration_seconds);
+    if total_duration_ms == 0 {
+        return Err("无法在未知时长的音频上启用混合语种模式。".into());
+    }
+
+    reporter.emit(
+        "analyze",
+        Some(15.0),
+        true,
+        Some("正在分析语音片段..."),
+        Some(0.0),
+        Some(total_duration_seconds),
+    );
+
+    let segments = detect_speech_segments(ffmpeg, input_wav, total_duration_ms)?;
+    if segments.is_empty() {
+        return Err("没有识别出可转写的语音片段。".into());
+    }
+
+    reporter.emit(
+        "analyze",
+        Some(25.0),
+        false,
+        Some(&format!("已整理出 {} 段候选语音片段。", segments.len())),
+        Some(0.0),
+        Some(total_duration_seconds),
+    );
+
+    let working_directory = unique_temp_directory("forph-whisper-mixed")?;
+    let total_segments = segments.len();
+
+    let result = (|| -> Result<(), String> {
+        let mut outputs = Vec::with_capacity(total_segments);
+
+        for (index, mut segment) in segments.into_iter().enumerate() {
+            let segment_wav = working_directory.join(format!("segment-{index:03}.wav"));
+            let output_base = working_directory.join(format!("segment-{index:03}"));
+            let output_segment_path = output_base.with_extension(format);
+            let segment_progress_start = 25.0 + (67.0 * index as f64 / total_segments as f64);
+            let segment_progress_end = 25.0 + (67.0 * (index + 1) as f64 / total_segments as f64);
+            let detect_progress_end =
+                segment_progress_start + ((segment_progress_end - segment_progress_start) * 0.2);
+
+            extract_segment_audio(ffmpeg, input_wav, &segment_wav, &segment)?;
+
+            reporter.emit(
+                "detect",
+                Some(segment_progress_start),
+                true,
+                Some(&format!("正在检测第 {}/{} 段语言...", index + 1, total_segments)),
+                Some(millis_to_seconds(segment.absolute_start_ms)),
+                Some(total_duration_seconds),
+            );
+
+            let detected_language =
+                run_whisper_language_detection(whisper_cmd, model_path, &segment_wav)
+                    .unwrap_or(None);
+            let language_to_use = detected_language
+                .as_deref()
+                .and_then(normalize_detected_language_label)
+                .unwrap_or_else(|| "auto".to_string());
+            segment.detected_language = Some(language_to_use.clone());
+
+            reporter.emit(
+                "detect",
+                Some(detect_progress_end),
+                false,
+                Some(&format!(
+                    "第 {}/{} 段检测到 {}。",
+                    index + 1,
+                    total_segments,
+                    display_language_label(&language_to_use)
+                )),
+                Some(millis_to_seconds(segment.absolute_start_ms)),
+                Some(total_duration_seconds),
+            );
+
+            let whisper_args = build_whisper_args(
+                model_path,
+                &segment_wav,
+                output_flag,
+                &output_base,
+                &language_to_use,
+                true,
+            );
+
+            run_whisper_with_progress(
+                reporter,
+                whisper_cmd.to_path_buf(),
+                whisper_args,
+                &format!(
+                    "正在转写第 {}/{} 段（{}）...",
+                    index + 1,
+                    total_segments,
+                    display_language_label(&language_to_use)
+                ),
+                (detect_progress_end, segment_progress_end),
+            )
+            .map_err(|details| format!("混合语种转写失败: {}", details))?;
+
+            reporter.emit(
+                "transcribe",
+                Some(segment_progress_end),
+                false,
+                Some(&format!("已完成第 {}/{} 段转写。", index + 1, total_segments)),
+                Some(millis_to_seconds(segment.absolute_end_ms.min(total_duration_ms))),
+                Some(total_duration_seconds),
+            );
+
+            outputs.push((segment, output_segment_path));
+        }
+
+        reporter.emit(
+            "merge",
+            Some(92.0),
+            true,
+            Some("正在合并分段结果..."),
+            Some(total_duration_seconds),
+            Some(total_duration_seconds),
+        );
+
+        let merged_output =
+            merge_transcription_chunk_outputs(&outputs, format, total_duration_ms)?;
+        std::fs::write(output_path, merged_output)
+            .map_err(|error| format!("写入合并后的转写结果失败: {}", error))?;
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir_all(&working_directory);
+    result
 }
 
 // ─── Commands ────────────────────────────────────────────
@@ -1438,10 +2453,12 @@ async fn transcribe_audio(
     language: Option<String>,
     output_format: Option<String>,
     job_id: Option<String>,
+    mixed_language_mode: Option<bool>,
 ) -> Result<ConversionResult, String> {
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp".into());
     };
+    let language = normalized_transcription_language(language)?;
 
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("转写前需要 FFmpeg 预处理音频".into());
@@ -1474,28 +2491,15 @@ async fn transcribe_audio(
         .strip_suffix(&format!(".{}", file_ext))
         .unwrap_or(&out_str)
         .to_string();
-
-    let mut whisper_args = vec![
-        "-pp".to_string(),
-        "-m".to_string(),
-        model_path.to_string_lossy().to_string(),
-        "-f".into(),
-        tmp_wav_str.clone(),
-        whisper_output_flag.into(),
-        "-of".into(),
-        of_base,
-    ];
-
-    if let Some(lang) = language {
-        whisper_args.extend(["-l".into(), lang]);
-    }
+    let use_mixed_language_mode =
+        mixed_language_mode.unwrap_or(false) && language == "auto" && total_duration.unwrap_or(0.0) > 0.0;
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path.clone());
         let transcription = (|| {
             run_ffmpeg_with_progress(
                 &reporter,
-                ffmpeg,
+                ffmpeg.clone(),
                 vec![
                     "-y".into(),
                     "-i".into(),
@@ -1511,18 +2515,45 @@ async fn transcribe_audio(
                 "preprocess",
                 "正在预处理音频...",
                 total_duration,
-                (0.0, 25.0),
+                if use_mixed_language_mode {
+                    (0.0, 15.0)
+                } else {
+                    (0.0, 25.0)
+                },
             )
             .map_err(|_| "音频预处理失败".to_string())?;
 
-            run_whisper_with_progress(
-                &reporter,
-                whisper_cmd,
-                whisper_args,
-                "正在转写音频...",
-                (25.0, 95.0),
-            )
-            .map_err(|details| format!("转写失败: {}", details))?;
+            if use_mixed_language_mode {
+                run_mixed_language_transcription(
+                    &reporter,
+                    &ffmpeg,
+                    &whisper_cmd,
+                    &model_path,
+                    &tmp_wav,
+                    whisper_output_flag,
+                    &fmt,
+                    &out,
+                    total_duration.unwrap_or_default(),
+                )?;
+            } else {
+                let whisper_args = build_whisper_args(
+                    &model_path,
+                    &tmp_wav,
+                    whisper_output_flag,
+                    Path::new(&of_base),
+                    &language,
+                    false,
+                );
+
+                run_whisper_with_progress(
+                    &reporter,
+                    whisper_cmd,
+                    whisper_args,
+                    "正在转写音频...",
+                    (25.0, 95.0),
+                )
+                .map_err(|details| format!("转写失败: {}", details))?;
+            }
 
             reporter.emit(
                 "finalize",
@@ -1611,27 +2642,88 @@ async fn install_dependency(package_name: String) -> Result<DependencyInstallRes
 }
 
 #[tauri::command]
+fn import_downloaded_model(
+    app: AppHandle,
+    model_name: Option<String>,
+) -> Result<ModelImportResult, String> {
+    let model_name = model_name
+        .unwrap_or_else(|| "base".into())
+        .trim()
+        .to_string();
+
+    if model_name.is_empty() {
+        return Err("模型名称不能为空。".into());
+    }
+
+    let downloads = downloads_dir();
+    let source_path = find_downloaded_model_candidate_in_dir(&downloads, &model_name).ok_or_else(
+        || {
+            format!(
+                "没有在下载目录里找到 ggml-{}.bin。请先下载模型，或确认它仍在 {}。",
+                model_name,
+                downloads.to_string_lossy()
+            )
+        },
+    )?;
+
+    let target_dir = preferred_model_directory(&app);
+    std::fs::create_dir_all(&target_dir).map_err(|error| format!("无法创建模型目录: {}", error))?;
+
+    let target_path = target_dir.join(format!("ggml-{}.bin", model_name));
+    std::fs::copy(&source_path, &target_path)
+        .map_err(|error| format!("复制模型文件失败: {}", error))?;
+
+    Ok(ModelImportResult {
+        model_name,
+        source_path: source_path.to_string_lossy().to_string(),
+        target_path: target_path.to_string_lossy().to_string(),
+        message: "已从下载目录导入模型文件。".into(),
+    })
+}
+
+#[tauri::command]
 fn get_drag_icon(app: AppHandle) -> String {
     ensure_drag_icon(&app).to_string_lossy().to_string()
 }
 
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
-    StdCommand::new("open")
-        .args(["-R", &path])
+    let resolved_path = validate_existing_local_target(&path)?;
+
+    command_with_augmented_path("open")
+        .arg("-R")
+        .arg(&resolved_path)
         .spawn()
         .map_err(|e| format!("无法打开 Finder: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
-fn open_target(target: String, ensure_directory: Option<bool>) -> Result<(), String> {
-    if ensure_directory.unwrap_or(false) && !is_probably_url(&target) {
-        std::fs::create_dir_all(&target).map_err(|e| format!("无法创建目录: {}", e))?;
-    }
+fn open_target(
+    app: AppHandle,
+    target: String,
+    ensure_directory: Option<bool>,
+) -> Result<(), String> {
+    let ensure_directory = ensure_directory.unwrap_or(false);
+    let validated_target =
+        validate_open_target_request(&target, ensure_directory, &preferred_model_directory(&app))?;
 
-    StdCommand::new("open")
-        .arg(&target)
+    let open_arg = match validated_target {
+        ValidatedOpenTarget::Url(url) => url,
+        ValidatedOpenTarget::Path(path) => {
+            let path_to_open = if ensure_directory {
+                std::fs::create_dir_all(&path).map_err(|e| format!("无法创建目录: {}", e))?;
+                path.canonicalize()
+                    .map_err(|e| format!("无法解析路径: {}", e))?
+            } else {
+                path
+            };
+            path_to_open.to_string_lossy().to_string()
+        }
+    };
+
+    command_with_augmented_path("open")
+        .arg(&open_arg)
         .spawn()
         .map_err(|e| format!("无法打开目标: {}", e))?;
     Ok(())
@@ -1653,6 +2745,7 @@ pub fn run() {
             extract_audio,
             transcribe_audio,
             install_dependency,
+            import_downloaded_model,
             get_drag_icon,
             reveal_in_finder,
             open_target,
@@ -1664,10 +2757,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_gif_window, compression_scale_filter, max_long_edge_for_resolution,
-        parse_ffmpeg_progress_line, parse_whisper_progress_percent, strip_frontmatter,
-        FfmpegProgressUpdate,
+        build_markdown_document, clamp_gif_window, compression_scale_filter, escape_html_text,
+        find_downloaded_model_candidate_in_dir, max_long_edge_for_resolution,
+        merge_srt_outputs, merge_vtt_outputs, normalize_detected_language_label,
+        normalize_speech_segments, normalized_transcription_language,
+        parse_detected_language, parse_ffmpeg_progress_line, parse_silencedetect_event_line,
+        parse_whisper_progress_percent, speech_segment, strip_frontmatter,
+        validate_existing_local_target, validate_open_target_request, FfmpegProgressUpdate,
+        SilenceEvent, ValidatedOpenTarget,
     };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_test_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("forph-{label}-{}-{unique}", std::process::id()))
+    }
 
     #[test]
     fn keeps_markdown_without_frontmatter() {
@@ -1762,5 +2873,299 @@ mod tests {
         assert_eq!(parse_whisper_progress_percent("[42%]"), Some(42.0));
         assert_eq!(parse_whisper_progress_percent("progress: 87.5%"), Some(87.5));
         assert_eq!(parse_whisper_progress_percent("no-progress-here"), None);
+    }
+
+    #[test]
+    fn escapes_html_text_for_markdown_title() {
+        assert_eq!(
+            escape_html_text(r#"<script>&"'demo"#),
+            "&lt;script&gt;&amp;&quot;&#39;demo"
+        );
+    }
+
+    #[test]
+    fn escapes_markdown_document_title_without_touching_body() {
+        let document = build_markdown_document(r#"<script>"'&"#, "<h1>Body</h1>");
+        assert!(document.contains("<title>&lt;script&gt;&quot;&#39;&amp;</title>"));
+        assert!(document.contains("<h1>Body</h1>"));
+    }
+
+    #[test]
+    fn allows_brew_download_url() {
+        assert_eq!(
+            validate_open_target_request("https://brew.sh", false, Path::new("/tmp/models")),
+            Ok(ValidatedOpenTarget::Url("https://brew.sh".into()))
+        );
+    }
+
+    #[test]
+    fn allows_huggingface_download_url() {
+        let url =
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true";
+        assert_eq!(
+            validate_open_target_request(url, false, Path::new("/tmp/models")),
+            Ok(ValidatedOpenTarget::Url(url.into()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_whitelisted_urls() {
+        let error = validate_open_target_request(
+            "https://example.com/file.bin",
+            false,
+            Path::new("/tmp/models"),
+        )
+        .expect_err("unexpectedly accepted untrusted url");
+        assert!(error.contains("受信任"));
+    }
+
+    #[test]
+    fn rejects_relative_paths_for_open_targets() {
+        let error = validate_open_target_request("relative/path", false, Path::new("/tmp/models"))
+            .expect_err("unexpectedly accepted relative path");
+        assert!(error.contains("绝对路径"));
+    }
+
+    #[test]
+    fn rejects_missing_local_paths() {
+        let missing_path = temp_test_path("missing");
+        let error = validate_existing_local_target(missing_path.to_string_lossy().as_ref())
+            .expect_err("unexpectedly accepted missing path");
+        assert!(error.contains("已存在"));
+    }
+
+    #[test]
+    fn ensure_directory_only_allows_preferred_model_directory() {
+        let temp_root = temp_test_path("models-root");
+        let allowed = temp_root.join("models");
+        let other = temp_root.join("somewhere-else");
+
+        let allowed_result = validate_open_target_request(
+            allowed.to_string_lossy().as_ref(),
+            true,
+            &allowed,
+        )
+        .expect("expected model directory to be allowed");
+        assert_eq!(allowed_result, ValidatedOpenTarget::Path(allowed.clone()));
+
+        let error = validate_open_target_request(other.to_string_lossy().as_ref(), true, &allowed)
+            .expect_err("unexpectedly accepted non-model directory");
+        assert!(error.contains("模型目录"));
+    }
+
+    #[test]
+    fn finds_downloaded_model_candidate_in_downloads() {
+        let downloads = temp_test_path("downloads");
+        fs::create_dir_all(&downloads).expect("create downloads dir");
+
+        let target = downloads.join("ggml-base.bin");
+        fs::write(&target, b"model").expect("write model");
+
+        assert_eq!(
+            find_downloaded_model_candidate_in_dir(&downloads, "base"),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn prefers_newest_matching_downloaded_model_candidate() {
+        let downloads = temp_test_path("downloads-latest");
+        fs::create_dir_all(&downloads).expect("create downloads dir");
+
+        let older = downloads.join("ggml-base.bin");
+        let newer = downloads.join("ggml-base (1).bin");
+        fs::write(&older, b"old").expect("write older model");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&newer, b"new").expect("write newer model");
+
+        assert_eq!(
+            find_downloaded_model_candidate_in_dir(&downloads, "base"),
+            Some(newer)
+        );
+    }
+
+    #[test]
+    fn defaults_transcription_language_to_auto() {
+        assert_eq!(
+            normalized_transcription_language(None).expect("language should default"),
+            "auto"
+        );
+        assert_eq!(
+            normalized_transcription_language(Some("".into())).expect("empty should normalize"),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn accepts_supported_transcription_languages() {
+        assert_eq!(
+            normalized_transcription_language(Some("DE".into())).expect("de should normalize"),
+            "de"
+        );
+        assert_eq!(
+            normalized_transcription_language(Some("zh".into())).expect("zh should normalize"),
+            "zh"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_transcription_languages() {
+        let error = normalized_transcription_language(Some("it".into()))
+            .expect_err("unexpectedly accepted unsupported language");
+        assert!(error.contains("不支持"));
+    }
+
+    #[test]
+    fn parses_silencedetect_log_lines() {
+        assert_eq!(
+            parse_silencedetect_event_line("[silencedetect @ 0x0] silence_start: 1.234"),
+            Some(SilenceEvent::Start(1234))
+        );
+        assert_eq!(
+            parse_silencedetect_event_line(
+                "[silencedetect @ 0x0] silence_end: 2.468 | silence_duration: 1.234"
+            ),
+            Some(SilenceEvent::End(2468))
+        );
+    }
+
+    #[test]
+    fn normalizes_segments_with_padding_split_and_short_merge() {
+        let raw_segments = vec![
+            speech_segment(1_000, 1_200).expect("segment"),
+            speech_segment(1_600, 1_900).expect("segment"),
+            speech_segment(2_100, 2_400).expect("segment"),
+            speech_segment(5_000, 14_500).expect("segment"),
+        ];
+
+        let normalized = normalize_speech_segments(raw_segments, 15_000);
+        assert_eq!(
+            normalized,
+            vec![
+                speech_segment(800, 2600).expect("merged short segments"),
+                speech_segment(4_800, 12_800).expect("split long segment 1"),
+                speech_segment(12_800, 14_700).expect("split long segment 2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_detected_language_from_whisper_output() {
+        assert_eq!(
+            parse_detected_language("main: auto-detected language: de (p = 0.93)"),
+            Some("de".into())
+        );
+        assert_eq!(
+            parse_detected_language("auto-detected language: Chinese"),
+            Some("zh".into())
+        );
+        assert_eq!(normalize_detected_language_label("Deutsch"), Some("de".into()));
+        assert_eq!(normalize_detected_language_label("unknown"), None);
+    }
+
+    #[test]
+    fn merges_srt_chunks_using_absolute_offsets() {
+        let temp_dir = temp_test_path("srt-merge");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let first = temp_dir.join("chunk-000.srt");
+        let second = temp_dir.join("chunk-001.srt");
+
+        fs::write(
+            &first,
+            "1\n00:00:00,000 --> 00:00:02,000\nHallo\n\n2\n00:00:02,000 --> 00:00:03,000\nWelt\n",
+        )
+        .expect("write first srt chunk");
+        fs::write(
+            &second,
+            "1\n00:00:00,500 --> 00:00:01,500\n你好\n",
+        )
+        .expect("write second srt chunk");
+
+        let merged = merge_srt_outputs(
+            &[
+                (
+                    speech_segment(0, 3_000).expect("segment 1"),
+                    first,
+                ),
+                (
+                    speech_segment(20_000, 23_000).expect("segment 2"),
+                    second,
+                ),
+            ],
+            30_000,
+        )
+        .expect("merge srt");
+        assert!(merged.contains("1\n00:00:00,000 --> 00:00:02,000\nHallo"));
+        assert!(merged.contains("2\n00:00:02,000 --> 00:00:03,000\nWelt"));
+        assert!(merged.contains("3\n00:00:20,500 --> 00:00:21,500\n你好"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn merges_vtt_chunks_with_single_header_and_absolute_offsets() {
+        let temp_dir = temp_test_path("vtt-merge");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let first = temp_dir.join("chunk-000.vtt");
+        let second = temp_dir.join("chunk-001.vtt");
+
+        fs::write(
+            &first,
+            "WEBVTT\n\n00:00.000 --> 00:02.000\nHallo\n",
+        )
+        .expect("write first vtt chunk");
+        fs::write(
+            &second,
+            "WEBVTT\n\n00:00.750 --> 00:02.250\n你好\n",
+        )
+        .expect("write second vtt chunk");
+
+        let merged = merge_vtt_outputs(
+            &[
+                (
+                    speech_segment(0, 3_000).expect("segment 1"),
+                    first,
+                ),
+                (
+                    speech_segment(20_000, 23_000).expect("segment 2"),
+                    second,
+                ),
+            ],
+            30_000,
+        )
+        .expect("merge vtt");
+        assert_eq!(merged.matches("WEBVTT").count(), 1);
+        assert!(merged.contains("00:00:00.000 --> 00:00:02.000\nHallo"));
+        assert!(merged.contains("00:00:20.750 --> 00:00:22.250\n你好"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn preserves_absolute_offsets_for_late_srt_segments() {
+        let temp_dir = temp_test_path("srt-late-merge");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let late = temp_dir.join("chunk-late.srt");
+        fs::write(
+            &late,
+            "1\n00:00:00,250 --> 00:00:01,250\nSpat\n",
+        )
+        .expect("write late srt chunk");
+
+        let merged = merge_srt_outputs(
+            &[(
+                speech_segment(570_000, 572_000).expect("late segment"),
+                late,
+            )],
+            600_000,
+        )
+        .expect("merge late srt");
+
+        assert!(merged.contains("1\n00:09:30,250 --> 00:09:31,250\nSpat"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

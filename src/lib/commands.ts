@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { isActionId } from "./actionIds";
 import type {
   ConversionResult,
   ConversionProgressEvent,
   DependencyInstallResult,
+  FileAction,
   FileInfo,
+  ModelImportResult,
 } from "./types";
 
 export const CONVERSION_PROGRESS_EVENT = "forph://conversion-progress";
@@ -18,7 +21,23 @@ export async function listenConversionProgress(
 }
 
 export async function getFileInfo(path: string): Promise<FileInfo> {
-  return invoke("get_file_info", { path });
+  const info = await invoke<Omit<FileInfo, "actions"> & {
+    actions: Array<Omit<FileAction, "id"> & { id: string }>;
+  }>("get_file_info", { path });
+
+  return {
+    ...info,
+    actions: info.actions.map((action) => {
+      if (!isActionId(action.id)) {
+        throw new Error(`后端返回了未知操作: ${action.id}`);
+      }
+
+      return {
+        ...action,
+        id: action.id,
+      };
+    }),
+  };
 }
 
 export async function convertImage(
@@ -89,6 +108,7 @@ export async function transcribeAudio(
   language?: string,
   outputFormat?: string,
   jobId?: string,
+  mixedLanguageMode?: boolean,
 ): Promise<ConversionResult> {
   return invoke("transcribe_audio", {
     inputPath,
@@ -96,6 +116,7 @@ export async function transcribeAudio(
     language: language ?? null,
     outputFormat: outputFormat ?? null,
     jobId: jobId ?? null,
+    mixedLanguageMode: mixedLanguageMode ?? null,
   });
 }
 
@@ -103,6 +124,12 @@ export async function installDependency(
   packageName: "ffmpeg" | "whisper-cpp",
 ): Promise<DependencyInstallResult> {
   return invoke("install_dependency", { packageName });
+}
+
+export async function importDownloadedModel(
+  modelName = "base",
+): Promise<ModelImportResult> {
+  return invoke("import_downloaded_model", { modelName });
 }
 
 export async function getDragIcon(): Promise<string> {

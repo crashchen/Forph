@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { ACTION_LABELS, type ActionId } from "../lib/actionIds";
 import type { FileInfo } from "../lib/types";
 import { listenConversionProgress } from "../lib/commands";
 import {
@@ -10,28 +11,9 @@ import {
 
 interface ConvertingProps {
   file: FileInfo;
-  actionId: string;
+  actionId: ActionId;
   jobId?: string;
 }
-
-const actionLabels: Record<string, string> = {
-  img_jpg: "转换为 JPG",
-  img_png: "转换为 PNG",
-  img_webp: "转换为 WebP",
-  md_html: "导出 HTML",
-  vid_gif: "转换为 GIF",
-  vid_compress: "压缩视频",
-  vid_mp3: "提取音频 (MP3)",
-  vid_wav: "提取音频 (WAV)",
-  vid_transcribe: "转写文字",
-  vid_transcribe_srt: "转写字幕 (SRT)",
-  vid_transcribe_vtt: "转写字幕 (VTT)",
-  aud_mp3: "转换为 MP3",
-  aud_wav: "转换为 WAV",
-  aud_transcribe: "转写文字",
-  aud_transcribe_srt: "转写字幕 (SRT)",
-  aud_transcribe_vtt: "转写字幕 (VTT)",
-};
 
 function formatPercent(percent?: number | null): string | null {
   if (percent == null || Number.isNaN(percent)) {
@@ -42,7 +24,7 @@ function formatPercent(percent?: number | null): string | null {
 }
 
 export function Converting({ file, actionId, jobId }: ConvertingProps) {
-  const label = actionLabels[actionId] || "处理中";
+  const label = ACTION_LABELS[actionId] || "处理中";
   const [percent, setPercent] = useState<number | null>(null);
   const [indeterminate, setIndeterminate] = useState(true);
   const [message, setMessage] = useState<string>("请稍候，正在本地处理...");

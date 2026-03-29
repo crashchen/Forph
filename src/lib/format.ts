@@ -18,7 +18,10 @@ const progressStageLabels: Record<string, string> = {
   extract: "提取中",
   compress: "压缩中",
   preprocess: "预处理中",
+  analyze: "分析片段",
+  detect: "检测语言",
   transcribe: "转写中",
+  merge: "合并结果",
   finalize: "收尾中",
 };
 

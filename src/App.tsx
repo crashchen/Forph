@@ -6,6 +6,7 @@ import { FileActions } from "./components/FileActions";
 import { Converting } from "./components/Converting";
 import { ResultPanel } from "./components/ResultPanel";
 import { BatchPanel } from "./components/BatchPanel";
+import type { ActionId } from "./lib/actionIds";
 import { getFileInfo } from "./lib/commands";
 import { getErrorMessage } from "./lib/errors";
 import type { AppView, BatchImportSummary, FileInfo } from "./lib/types";
@@ -203,7 +204,7 @@ export default function App() {
             <FileActions
               file={view.file}
               isDragOver={isDragOver}
-              onConversionStart={(actionId, jobId) =>
+              onConversionStart={(actionId: ActionId, jobId) =>
                 setView({ stage: "converting", file: view.file, actionId, jobId })
               }
               onFileRefreshed={(sourcePath, file) =>

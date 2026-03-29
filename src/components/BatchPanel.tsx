@@ -1,19 +1,19 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
-  AlertTriangle,
-  CheckCircle2,
   FileText,
-  FolderOpen,
-  GripVertical,
   Image,
-  Loader2,
   Music,
-  RotateCcw,
   Video,
-  X,
-  XCircle,
+  type LucideIcon,
 } from "lucide-react";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
+import {
+  ACTION_IDS,
+  imageActionIdFromOutputFormat,
+  imageOutputFormatFromActionId,
+  isImageActionId,
+  type ActionId,
+} from "../lib/actionIds";
 import type {
   BatchFileResult,
   BatchImportSummary,
@@ -28,31 +28,40 @@ import {
   extractAudio,
   getDragIcon,
   getFileInfo,
+  importDownloadedModel,
   installDependency,
   listenConversionProgress,
   revealInFinder,
   transcribeAudio,
   videoToGif,
 } from "../lib/commands";
-import {
-  formatProgressStage,
-  formatProgressTimeRange,
-  formatSize,
-} from "../lib/format";
 import { getErrorMessage } from "../lib/errors";
 import {
   actionUsesRealtimeProgress,
-  getBatchActionDisabledReason,
   getBatchActions,
   shouldSkipBatchAction,
 } from "../lib/actions";
-import { GifOptions } from "./GifOptions";
-import { CompressOptions } from "./CompressOptions";
-import { ImageOptions } from "./ImageOptions";
+import { BatchProgressView } from "./batch/BatchProgressView";
+import { BatchResultView } from "./batch/BatchResultView";
+import { BatchSelectionView } from "./batch/BatchSelectionView";
 import {
-  DependencySection,
+  batchPanelReducer,
+  buildInitialResults,
+  createInitialBatchState,
+  type BatchActionOptions,
+  type BatchRunContext,
   type InstallableDependency,
-} from "./DependencySection";
+} from "./batch/batchState";
+import { formatSize } from "../lib/format";
+import {
+  loadTranscriptionPreferences,
+  modelFileName,
+  resolveEffectiveTranscriptionModel,
+  saveTranscriptionPreferences,
+  waitForModelAvailability,
+  type TranscriptionLanguage,
+  type TranscriptionModel,
+} from "../lib/transcription";
 
 interface BatchPanelProps {
   files: FileInfo[];
@@ -62,22 +71,7 @@ interface BatchPanelProps {
   onReset: () => void;
 }
 
-interface BatchActionOptions {
-  gifFps?: number;
-  gifWidth?: number;
-  gifStartTime?: number;
-  gifDuration?: number;
-  compressQuality?: string;
-  compressMaxResolution?: string;
-  imageQuality?: number;
-}
-
-interface BatchRunContext {
-  actionId: string;
-  options?: BatchActionOptions;
-}
-
-const typeIcons: Record<string, typeof Image> = {
+const typeIcons: Record<string, LucideIcon> = {
   image: Image,
   markdown: FileText,
   video: Video,
@@ -91,20 +85,22 @@ const typeLabels: Record<string, string> = {
   markdown: "个文档",
 };
 
-function createJobId(actionId: string, filePath: string): string {
+const TRANSCRIPTION_ACTION_IDS = new Set<ActionId>([
+  ACTION_IDS.VID_TRANSCRIBE,
+  ACTION_IDS.AUD_TRANSCRIBE,
+  ACTION_IDS.VID_TRANSCRIBE_SRT,
+  ACTION_IDS.AUD_TRANSCRIBE_SRT,
+  ACTION_IDS.VID_TRANSCRIBE_VTT,
+  ACTION_IDS.AUD_TRANSCRIBE_VTT,
+]);
+
+function createJobId(actionId: ActionId, filePath: string): string {
   const suffix =
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const name = filePath.split("/").pop() ?? "file";
   return `${actionId}:${name}:${suffix}`;
-}
-
-function buildInitialResults(files: FileInfo[]): BatchFileResult[] {
-  return files.map((file) => ({
-    file,
-    status: "pending",
-  }));
 }
 
 function formatImportWarnings(summary: BatchImportSummary): string[] {
@@ -121,14 +117,6 @@ function formatImportWarnings(summary: BatchImportSummary): string[] {
   }
 
   return warnings;
-}
-
-function formatPercent(value: number | null): string | null {
-  if (value == null || Number.isNaN(value)) {
-    return null;
-  }
-
-  return `${Math.round(value)}%`;
 }
 
 function buildStatusLabel(result: BatchFileResult): string {
@@ -150,51 +138,74 @@ function buildStatusLabel(result: BatchFileResult): string {
 
 async function runAction(
   file: FileInfo,
-  actionId: string,
+  actionId: ActionId,
   opts?: BatchActionOptions,
   jobId?: string,
 ) {
-  if (actionId.startsWith("img_")) {
-    return convertImage(file.path, actionId.replace("img_", ""), opts?.imageQuality);
+  switch (actionId) {
+    case ACTION_IDS.IMG_JPG:
+    case ACTION_IDS.IMG_PNG:
+    case ACTION_IDS.IMG_WEBP:
+      return convertImage(
+        file.path,
+        imageOutputFormatFromActionId(actionId),
+        opts?.imageQuality,
+      );
+    case ACTION_IDS.MD_HTML:
+      return exportMarkdown(file.path);
+    case ACTION_IDS.VID_GIF:
+      return videoToGif(
+        file.path,
+        opts?.gifFps ?? 15,
+        opts?.gifWidth ?? 480,
+        opts?.gifStartTime,
+        opts?.gifDuration,
+        jobId,
+      );
+    case ACTION_IDS.VID_COMPRESS:
+      return compressVideo(
+        file.path,
+        opts?.compressQuality ?? "balanced",
+        opts?.compressMaxResolution,
+        jobId,
+      );
+    case ACTION_IDS.VID_MP3:
+    case ACTION_IDS.AUD_MP3:
+      return extractAudio(file.path, "mp3", jobId);
+    case ACTION_IDS.VID_WAV:
+    case ACTION_IDS.AUD_WAV:
+      return extractAudio(file.path, "wav", jobId);
+    case ACTION_IDS.VID_TRANSCRIBE:
+    case ACTION_IDS.AUD_TRANSCRIBE:
+      return transcribeAudio(
+        file.path,
+        opts?.transcriptionModel ?? "base",
+        opts?.transcriptionLanguage ?? "auto",
+        undefined,
+        jobId,
+        opts?.transcriptionMixedLanguageMode,
+      );
+    case ACTION_IDS.VID_TRANSCRIBE_SRT:
+    case ACTION_IDS.AUD_TRANSCRIBE_SRT:
+      return transcribeAudio(
+        file.path,
+        opts?.transcriptionModel ?? "base",
+        opts?.transcriptionLanguage ?? "auto",
+        "srt",
+        jobId,
+        opts?.transcriptionMixedLanguageMode,
+      );
+    case ACTION_IDS.VID_TRANSCRIBE_VTT:
+    case ACTION_IDS.AUD_TRANSCRIBE_VTT:
+      return transcribeAudio(
+        file.path,
+        opts?.transcriptionModel ?? "base",
+        opts?.transcriptionLanguage ?? "auto",
+        "vtt",
+        jobId,
+        opts?.transcriptionMixedLanguageMode,
+      );
   }
-  if (actionId === "md_html") {
-    return exportMarkdown(file.path);
-  }
-  if (actionId === "vid_gif") {
-    return videoToGif(
-      file.path,
-      opts?.gifFps ?? 15,
-      opts?.gifWidth ?? 480,
-      opts?.gifStartTime,
-      opts?.gifDuration,
-      jobId,
-    );
-  }
-  if (actionId === "vid_compress") {
-    return compressVideo(
-      file.path,
-      opts?.compressQuality ?? "balanced",
-      opts?.compressMaxResolution,
-      jobId,
-    );
-  }
-  if (actionId === "vid_mp3" || actionId === "aud_mp3") {
-    return extractAudio(file.path, "mp3", jobId);
-  }
-  if (actionId === "vid_wav" || actionId === "aud_wav") {
-    return extractAudio(file.path, "wav", jobId);
-  }
-  if (actionId === "vid_transcribe" || actionId === "aud_transcribe") {
-    return transcribeAudio(file.path, "base", undefined, undefined, jobId);
-  }
-  if (actionId === "vid_transcribe_srt" || actionId === "aud_transcribe_srt") {
-    return transcribeAudio(file.path, "base", undefined, "srt", jobId);
-  }
-  if (actionId === "vid_transcribe_vtt" || actionId === "aud_transcribe_vtt") {
-    return transcribeAudio(file.path, "base", undefined, "vtt", jobId);
-  }
-
-  throw new Error(`未知操作: ${actionId}`);
 }
 
 export function BatchPanel({
@@ -204,46 +215,28 @@ export function BatchPanel({
   onFilesRefreshed,
   onReset,
 }: BatchPanelProps) {
-  const [phase, setPhase] = useState<"selecting" | "converting" | "done">(
-    "selecting",
+  const [state, dispatch] = useReducer(batchPanelReducer, files, createInitialBatchState);
+  const [preferredModel, setPreferredModel] = useState<TranscriptionModel>(
+    () => loadTranscriptionPreferences().preferredModel,
   );
-  const [completionState, setCompletionState] = useState<"completed" | "stopped">(
-    "completed",
+  const [preferredLanguage, setPreferredLanguage] = useState<TranscriptionLanguage>(
+    () => loadTranscriptionPreferences().preferredLanguage,
   );
-  const [results, setResults] = useState<BatchFileResult[]>(() =>
-    buildInitialResults(files),
-  );
-  const [currentIndex, setCurrentIndex] = useState<number | null>(null);
-  const [currentJobId, setCurrentJobId] = useState<string | null>(null);
-  const [currentFileProgress, setCurrentFileProgress] = useState<number | null>(
-    null,
-  );
-  const [currentProgressIndeterminate, setCurrentProgressIndeterminate] =
-    useState(true);
-  const [currentMessage, setCurrentMessage] = useState("准备开始处理...");
-  const [currentStage, setCurrentStage] = useState<string | null>(null);
-  const [currentSeconds, setCurrentSeconds] = useState<number | null>(null);
-  const [totalSeconds, setTotalSeconds] = useState<number | null>(null);
-  const [showGifOptions, setShowGifOptions] = useState(false);
-  const [showCompressOptions, setShowCompressOptions] = useState(false);
-  const [imageOutputFormat, setImageOutputFormat] = useState<string | null>(null);
-  const [installingDependency, setInstallingDependency] =
-    useState<InstallableDependency | null>(null);
-  const [dependencyMessage, setDependencyMessage] = useState<string | null>(
-    null,
-  );
-  const [dependencyError, setDependencyError] = useState<string | null>(null);
-  const [lastRunContext, setLastRunContext] = useState<BatchRunContext | null>(
-    null,
-  );
-  const [stopRequested, setStopRequested] = useState(false);
+  const [preferMixedLanguageMode, setPreferMixedLanguageMode] =
+    useState<boolean>(() => loadTranscriptionPreferences().preferMixedLanguageMode);
   const stopAfterCurrentRef = useRef(false);
   const isMountedRef = useRef(true);
-  const resultsRef = useRef(results);
+  const resultsRef = useRef(state.results);
+  const modelRefreshRequestIdRef = useRef(0);
+  const previousFileIdentityRef = useRef<string | null>(null);
+  const fileIdentity = useMemo(
+    () => files.map((file) => file.path).join("\n"),
+    [files],
+  );
 
   useEffect(() => {
-    resultsRef.current = results;
-  }, [results]);
+    resultsRef.current = state.results;
+  }, [state.results]);
 
   useEffect(() => {
     return () => {
@@ -252,46 +245,52 @@ export function BatchPanel({
   }, []);
 
   useEffect(() => {
-    setPhase("selecting");
-    setCompletionState("completed");
-    setResults(buildInitialResults(files));
-    setCurrentIndex(null);
-    setCurrentJobId(null);
-    setCurrentFileProgress(null);
-    setCurrentProgressIndeterminate(true);
-    setCurrentMessage("准备开始处理...");
-    setCurrentStage(null);
-    setCurrentSeconds(null);
-    setTotalSeconds(null);
-    setShowGifOptions(false);
-    setShowCompressOptions(false);
-    setImageOutputFormat(null);
-    setDependencyMessage(null);
-    setDependencyError(null);
-    setStopRequested(false);
+    if (previousFileIdentityRef.current === fileIdentity) {
+      return;
+    }
+
+    previousFileIdentityRef.current = fileIdentity;
+    dispatch({ type: "resetForFiles", files });
     stopAfterCurrentRef.current = false;
-  }, [files]);
+  }, [fileIdentity, files]);
 
   useEffect(() => {
+    saveTranscriptionPreferences({
+      preferredModel,
+      preferredLanguage,
+      preferMixedLanguageMode,
+    });
+  }, [preferMixedLanguageMode, preferredLanguage, preferredModel]);
+
+  useEffect(() => {
+    dispatch({ type: "modelRefreshCompleted", state: "idle" });
+    modelRefreshRequestIdRef.current += 1;
+  }, [preferredModel]);
+
+  useEffect(() => {
+    if (!state.progress.currentJobId) {
+      return;
+    }
+
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
     void listenConversionProgress((event: ConversionProgressEvent) => {
-      if (disposed || !currentJobId || event.jobId !== currentJobId) {
+      if (
+        disposed ||
+        !state.progress.currentJobId ||
+        event.jobId !== state.progress.currentJobId
+      ) {
         return;
       }
 
-      setCurrentFileProgress(event.percent ?? null);
-      setCurrentProgressIndeterminate(event.indeterminate);
-      setCurrentMessage(event.message ?? "正在处理当前文件...");
-      setCurrentStage(event.stage);
-      setCurrentSeconds(event.currentSeconds ?? null);
-      setTotalSeconds(event.totalSeconds ?? null);
+      dispatch({ type: "progressReceived", event });
     }).then((fn) => {
       if (disposed) {
         fn();
         return;
       }
+
       unlisten = fn;
     });
 
@@ -299,13 +298,63 @@ export function BatchPanel({
       disposed = true;
       unlisten?.();
     };
-  }, [currentJobId]);
+  }, [state.progress.currentJobId]);
 
   const fileType = files[0]?.file_type ?? "unknown";
   const runtime = files[0]?.runtime;
-  const Icon = typeIcons[fileType] || FileText;
-  const totalSize = files.reduce((sum, file) => sum + file.size, 0);
-  const importWarnings = formatImportWarnings(importSummary);
+  const resolvedModel = useMemo(
+    () => resolveEffectiveTranscriptionModel(runtime, preferredModel),
+    [runtime, preferredModel],
+  );
+  const effectiveModel = resolvedModel.effectiveModel;
+  const Icon = typeIcons[fileType] ?? FileText;
+  const totalSize = useMemo(
+    () => files.reduce((sum, file) => sum + file.size, 0),
+    [files],
+  );
+  const importWarnings = useMemo(
+    () => formatImportWarnings(importSummary),
+    [importSummary],
+  );
+  const groupedActions = useMemo(
+    () =>
+      Object.entries(
+        getBatchActions(files).reduce<Record<string, FileAction[]>>((acc, action) => {
+          if (!acc[action.group]) {
+            acc[action.group] = [];
+          }
+          acc[action.group].push(action);
+          return acc;
+        }, {}),
+      ),
+    [files],
+  );
+
+  const buildTranscriptionOptions = useCallback(
+    (): Pick<
+      BatchActionOptions,
+      "transcriptionModel" | "transcriptionLanguage" | "transcriptionMixedLanguageMode"
+    > => ({
+      transcriptionModel: effectiveModel ?? preferredModel,
+      transcriptionLanguage: preferredLanguage,
+      transcriptionMixedLanguageMode: preferMixedLanguageMode,
+    }),
+    [effectiveModel, preferMixedLanguageMode, preferredLanguage, preferredModel],
+  );
+
+  const mergeActionOptions = useCallback(
+    (actionId: ActionId, options?: BatchActionOptions): BatchActionOptions | undefined => {
+      if (!TRANSCRIPTION_ACTION_IDS.has(actionId)) {
+        return options;
+      }
+
+      return {
+        ...options,
+        ...buildTranscriptionOptions(),
+      };
+    },
+    [buildTranscriptionOptions],
+  );
 
   const executeBatch = useCallback(
     async (
@@ -317,18 +366,7 @@ export function BatchPanel({
         return;
       }
 
-      setLastRunContext(context);
-      setPhase("converting");
-      setCompletionState("completed");
-      setCurrentIndex(null);
-      setCurrentJobId(null);
-      setCurrentFileProgress(null);
-      setCurrentProgressIndeterminate(true);
-      setCurrentMessage("准备开始处理...");
-      setCurrentStage(null);
-      setCurrentSeconds(null);
-      setTotalSeconds(null);
-      setStopRequested(false);
+      dispatch({ type: "runStarted", context });
       stopAfterCurrentRef.current = false;
 
       const nextResults =
@@ -346,7 +384,7 @@ export function BatchPanel({
       }
 
       if (isMountedRef.current) {
-        setResults([...nextResults]);
+        dispatch({ type: "resultsReplaced", results: [...nextResults] });
       }
 
       let stopped = false;
@@ -365,7 +403,7 @@ export function BatchPanel({
             status: "skipped",
           };
           if (isMountedRef.current) {
-            setResults([...nextResults]);
+            dispatch({ type: "resultsReplaced", results: [...nextResults] });
           }
           continue;
         }
@@ -380,15 +418,8 @@ export function BatchPanel({
         };
 
         if (isMountedRef.current) {
-          setCurrentIndex(index);
-          setCurrentJobId(jobId ?? null);
-          setCurrentFileProgress(jobId ? 0 : null);
-          setCurrentProgressIndeterminate(Boolean(jobId));
-          setCurrentMessage("正在处理当前文件...");
-          setCurrentStage(null);
-          setCurrentSeconds(null);
-          setTotalSeconds(null);
-          setResults([...nextResults]);
+          dispatch({ type: "resultsReplaced", results: [...nextResults] });
+          dispatch({ type: "fileStarted", index, jobId: jobId ?? null });
         }
 
         try {
@@ -410,13 +441,7 @@ export function BatchPanel({
           return;
         }
 
-        setCurrentJobId(null);
-        setCurrentFileProgress(null);
-        setCurrentProgressIndeterminate(true);
-        setCurrentStage(null);
-        setCurrentSeconds(null);
-        setTotalSeconds(null);
-        setResults([...nextResults]);
+        dispatch({ type: "fileFinished", results: [...nextResults] });
       }
 
       if (stopAfterCurrentRef.current) {
@@ -435,34 +460,30 @@ export function BatchPanel({
       }
 
       if (isMountedRef.current) {
-        setResults([...nextResults]);
-        setCurrentIndex(null);
-        setCurrentJobId(null);
-        setCurrentFileProgress(null);
-        setCurrentProgressIndeterminate(true);
-        setCurrentMessage(
-          stopped ? "已按你的要求在当前文件后停止，剩余项未执行。" : "全部处理完成。",
-        );
-        setCurrentStage(null);
-        setCurrentSeconds(null);
-        setTotalSeconds(null);
-        setCompletionState(stopped ? "stopped" : "completed");
-        setPhase("done");
+        dispatch({
+          type: "runCompleted",
+          results: [...nextResults],
+          stopped,
+        });
       }
     },
     [files],
   );
 
   const startBatch = useCallback(
-    async (actionId: string, options?: BatchActionOptions) => {
+    async (actionId: ActionId, options?: BatchActionOptions) => {
       const selectedIndices = files.map((_, index) => index);
-      await executeBatch({ actionId, options }, selectedIndices, "all");
+      await executeBatch(
+        { actionId, options: mergeActionOptions(actionId, options) },
+        selectedIndices,
+        "all",
+      );
     },
-    [executeBatch, files],
+    [executeBatch, files, mergeActionOptions],
   );
 
   const retryFailedItems = useCallback(async () => {
-    if (!lastRunContext) {
+    if (!state.lastRunContext) {
       return;
     }
 
@@ -471,11 +492,11 @@ export function BatchPanel({
       .filter(({ result }) => result.status === "error")
       .map(({ index }) => index);
 
-    await executeBatch(lastRunContext, failedIndices, "partial");
-  }, [executeBatch, lastRunContext]);
+    await executeBatch(state.lastRunContext, failedIndices, "partial");
+  }, [executeBatch, state.lastRunContext]);
 
   const continueRemainingItems = useCallback(async () => {
-    if (!lastRunContext) {
+    if (!state.lastRunContext) {
       return;
     }
 
@@ -484,14 +505,81 @@ export function BatchPanel({
       .filter(({ result }) => result.status === "cancelled")
       .map(({ index }) => index);
 
-    await executeBatch(lastRunContext, cancelledIndices, "partial");
-  }, [executeBatch, lastRunContext]);
+    await executeBatch(state.lastRunContext, cancelledIndices, "partial");
+  }, [executeBatch, state.lastRunContext]);
+
+  const refreshBatchFilesForModel = useCallback(
+    async (
+      expectedModel: TranscriptionModel,
+      messagePrefix: string,
+    ): Promise<"ready" | "stale"> => {
+      const firstFile = files[0];
+      if (!firstFile) {
+        return "stale";
+      }
+      const requestId = modelRefreshRequestIdRef.current + 1;
+      modelRefreshRequestIdRef.current = requestId;
+
+      dispatch({
+        type: "modelRefreshStarted",
+        message: `${messagePrefix} 正在刷新模型状态...`,
+      });
+
+      const refreshResult = await waitForModelAvailability(firstFile.path, expectedModel, {
+        attempts: 8,
+        delayMs: 250,
+        shouldContinue: () =>
+          isMountedRef.current && modelRefreshRequestIdRef.current === requestId,
+      });
+
+      if (!isMountedRef.current || modelRefreshRequestIdRef.current !== requestId) {
+        return "stale";
+      }
+
+      const refreshedSettled = await Promise.allSettled(
+        files.map((file) => getFileInfo(file.path)),
+      );
+      if (!isMountedRef.current || modelRefreshRequestIdRef.current !== requestId) {
+        return "stale";
+      }
+
+      let refreshFailures = 0;
+      const refreshed = refreshedSettled.map((entry, index) => {
+        if (entry.status === "fulfilled") {
+          return entry.value;
+        }
+
+        refreshFailures += 1;
+        return files[index];
+      });
+
+      onFilesRefreshed(refreshed);
+
+      if (refreshResult.status === "ready") {
+        dispatch({
+          type: "modelRefreshCompleted",
+          state: "success",
+          message:
+            refreshFailures > 0
+              ? `${modelFileName(expectedModel)} 已就绪，已刷新 ${files.length - refreshFailures} 个文件，${refreshFailures} 个保留原状态。`
+              : `${modelFileName(expectedModel)} 已就绪，文件列表已刷新。`,
+        });
+        return "ready";
+      }
+
+      dispatch({
+        type: "modelRefreshCompleted",
+        state: "stale",
+        message: `${modelFileName(expectedModel)} 已复制到模型目录，但当前还没完成识别。可以点“重新检测模型”再试一次。`,
+      });
+      return "stale";
+    },
+    [files, onFilesRefreshed],
+  );
 
   const handleDependencyInstall = useCallback(
     async (packageName: InstallableDependency) => {
-      setDependencyMessage(null);
-      setDependencyError(null);
-      setInstallingDependency(packageName);
+      dispatch({ type: "dependencyInstallStarted", dependency: packageName });
 
       try {
         const result = await installDependency(packageName);
@@ -517,476 +605,196 @@ export function BatchPanel({
         });
 
         onFilesRefreshed(refreshed);
-        setDependencyMessage(
-          refreshFailures > 0
-            ? `${result.message} 已刷新 ${files.length - refreshFailures} 个文件，${refreshFailures} 个保留原状态。`
-            : `${result.message} 文件列表已刷新。`,
-        );
+        dispatch({
+          type: "dependencyInstallFinished",
+          message:
+            refreshFailures > 0
+              ? `${result.message} 已刷新 ${files.length - refreshFailures} 个文件，${refreshFailures} 个保留原状态。`
+              : `${result.message} 文件列表已刷新。`,
+        });
       } catch (error) {
         if (!isMountedRef.current) {
           return;
         }
-        setDependencyError(getErrorMessage(error, "自动安装失败"));
-      } finally {
-        if (isMountedRef.current) {
-          setInstallingDependency(null);
-        }
+
+        dispatch({
+          type: "dependencyInstallFinished",
+          error: getErrorMessage(error, "自动安装失败"),
+        });
       }
     },
     [files, onFilesRefreshed],
   );
 
+  const handleModelImport = useCallback(async () => {
+    dispatch({ type: "modelImportStarted" });
+
+    try {
+      const result = await importDownloadedModel(preferredModel);
+      if (!isMountedRef.current) {
+        return;
+      }
+
+      await refreshBatchFilesForModel(preferredModel, result.message);
+    } catch (error) {
+      if (!isMountedRef.current) {
+        return;
+      }
+
+      dispatch({
+        type: "modelRefreshCompleted",
+        state: "idle",
+        error: getErrorMessage(error, "自动导入模型失败"),
+      });
+    }
+  }, [preferredModel, refreshBatchFilesForModel]);
+
+  const handleRetryModelDetection = useCallback(async () => {
+    await refreshBatchFilesForModel(
+      preferredModel,
+      `正在重新检测 ${modelFileName(preferredModel)}。`,
+    );
+  }, [preferredModel, refreshBatchFilesForModel]);
+
   const handleDragAllOut = useCallback(async () => {
-    const paths = results
+    const paths = state.results
       .filter((result) => result.status === "success" && result.result)
       .map((result) => result.result!.output_path);
+
     if (paths.length === 0) {
       return;
     }
+
     try {
       const icon = await getDragIcon();
       await startDrag({ item: paths, icon });
     } catch {
       // Drag cancelled or not supported
     }
-  }, [results]);
+  }, [state.results]);
 
-  const successResults = results.filter((result) => result.status === "success");
-  const failedResults = results.filter((result) => result.status === "error");
-  const skippedResults = results.filter((result) => result.status === "skipped");
-  const cancelledResults = results.filter(
-    (result) => result.status === "cancelled",
+  const handleToggleActionPanel = useCallback((action: FileAction) => {
+    if (action.id === ACTION_IDS.VID_GIF) {
+      dispatch({ type: "toggleGifOptions" });
+      return;
+    }
+
+    if (action.id === ACTION_IDS.VID_COMPRESS) {
+      dispatch({ type: "toggleCompressOptions" });
+      return;
+    }
+
+    if (isImageActionId(action.id)) {
+      dispatch({
+        type: "toggleImageOptions",
+        format: imageOutputFormatFromActionId(action.id),
+      });
+    }
+  }, []);
+
+  const handleImageConvert = useCallback(
+    async (quality?: number) => {
+      if (state.optionsPanel?.kind !== "image") {
+        return;
+      }
+
+      await startBatch(imageActionIdFromOutputFormat(state.optionsPanel.format), {
+        imageQuality: quality,
+      });
+    },
+    [startBatch, state.optionsPanel],
   );
-  const totalOutputSize = successResults.reduce(
-    (sum, result) => sum + (result.result?.output_size ?? 0),
-    0,
-  );
 
-  if (phase === "selecting") {
-    const groups = getBatchActions(files).reduce(
-      (acc, action) => {
-        if (!acc[action.group]) {
-          acc[action.group] = [];
-        }
-        acc[action.group].push(action);
-        return acc;
-      },
-      {} as Record<string, FileAction[]>,
-    );
+  const handleRequestStop = useCallback(() => {
+    stopAfterCurrentRef.current = true;
+    dispatch({ type: "stopRequested" });
+  }, []);
 
+  if (state.phase === "selecting") {
     return (
-      <div
-        className={`animate-fade-up w-full max-w-xl transition-opacity ${isDragOver ? "opacity-30" : ""}`}
-      >
-        <div className="glass p-5 rounded-2xl mb-4">
-          <div className="flex items-center gap-4">
-            <div className="w-12 h-12 rounded-xl bg-accent-dim flex items-center justify-center shrink-0">
-              <Icon size={22} className="text-accent" />
-            </div>
-            <div className="flex-1 min-w-0 text-left">
-              <h3 className="text-sm font-semibold text-white/90">
-                {files.length} {typeLabels[fileType] || "个文件"}
-              </h3>
-              <p className="text-xs text-white/40 mt-0.5">
-                共 {formatSize(totalSize)}
-              </p>
-            </div>
-            <button
-              onClick={onReset}
-              className="no-drag p-2 rounded-lg hover:bg-surface-hover text-white/30 hover:text-white/60 transition-colors cursor-pointer"
-            >
-              <X size={16} />
-            </button>
-          </div>
-
-          <div className="mt-3 max-h-32 overflow-y-auto space-y-1">
-            {files.map((file) => (
-              <div
-                key={file.path}
-                className="flex items-center justify-between text-xs text-white/40 px-1"
-              >
-                <span className="truncate flex-1 min-w-0">{file.name}</span>
-                <span className="shrink-0 ml-2 text-white/25">
-                  {formatSize(file.size)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {importWarnings.length > 0 && (
-          <div className="mb-4 glass p-4 rounded-2xl text-left">
-            <div className="flex items-start gap-3">
-              <AlertTriangle size={16} className="text-warning shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <p className="text-sm font-medium text-white/78">这次批量已自动收口</p>
-                {importWarnings.map((warning) => (
-                  <p key={warning} className="text-xs text-white/42 leading-relaxed">
-                    {warning}
-                  </p>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {Object.entries(groups).map(([group, groupActions]) => (
-          <div key={group} className="mb-3">
-            <p className="text-[11px] font-medium text-white/30 uppercase tracking-widest mb-2 px-1">
-              {group}
-            </p>
-            <div className="flex flex-wrap gap-2">
-              {groupActions.map((action) => {
-                const disabledReason = getBatchActionDisabledReason(files, action);
-                const disabled = Boolean(disabledReason);
-                const hasOptionsPanel =
-                  action.id === "vid_gif" ||
-                  action.id === "vid_compress" ||
-                  action.id.startsWith("img_");
-
-                if (hasOptionsPanel) {
-                  const togglePanel = () => {
-                    if (action.id === "vid_gif") {
-                      setShowGifOptions((value) => !value);
-                      setShowCompressOptions(false);
-                      setImageOutputFormat(null);
-                    } else if (action.id === "vid_compress") {
-                      setShowCompressOptions((value) => !value);
-                      setShowGifOptions(false);
-                      setImageOutputFormat(null);
-                    } else {
-                      const format = action.id.replace("img_", "");
-                      setImageOutputFormat((value) => (value === format ? null : format));
-                      setShowGifOptions(false);
-                      setShowCompressOptions(false);
-                    }
-                  };
-
-                  return (
-                    <button
-                      key={action.id}
-                      title={disabledReason ?? action.label}
-                      disabled={disabled}
-                      onClick={togglePanel}
-                      className={`no-drag glass glass-hover px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                        disabled
-                          ? "cursor-not-allowed text-white/28 border-white/6 hover:bg-transparent"
-                          : "cursor-pointer text-white/70 hover:text-white/90"
-                      }`}
-                    >
-                      {action.label}
-                    </button>
-                  );
-                }
-
-                return (
-                  <button
-                    key={action.id}
-                    title={disabledReason ?? action.label}
-                    disabled={disabled}
-                    onClick={() => {
-                      void startBatch(action.id);
-                    }}
-                    className={`no-drag glass glass-hover px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                      disabled
-                        ? "cursor-not-allowed text-white/28 border-white/6 hover:bg-transparent"
-                        : "cursor-pointer text-white/70 hover:text-white/90"
-                    }`}
-                  >
-                    {action.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        ))}
-
-        {showGifOptions && (
-          <GifOptions
-            file={files[0]}
-            onConvert={(fps, width, startTime, duration) => {
-              void startBatch("vid_gif", {
-                gifFps: fps,
-                gifWidth: width,
-                gifStartTime: startTime,
-                gifDuration: duration,
-              });
-            }}
-          />
-        )}
-        {showCompressOptions && (
-          <CompressOptions
-            file={files[0]}
-            onCompress={(quality, maxResolution) => {
-              void startBatch("vid_compress", {
-                compressQuality: quality,
-                compressMaxResolution: maxResolution,
-              });
-            }}
-          />
-        )}
-        {imageOutputFormat && (
-          <ImageOptions
-            outputFormat={imageOutputFormat}
-            onConvert={(quality) => {
-              void startBatch(`img_${imageOutputFormat}`, {
-                imageQuality: quality,
-              });
-            }}
-          />
-        )}
-
-        {runtime && (
-          <DependencySection
-            runtime={runtime}
-            installingDependency={installingDependency}
-            dependencyMessage={dependencyMessage}
-            dependencyError={dependencyError}
-            onInstallDependency={handleDependencyInstall}
-          />
-        )}
-
-        <p className="text-center text-xs text-white/20 mt-6">
-          选择操作后会按当前顺序批量处理 {files.length} 个文件
-        </p>
-      </div>
+      <BatchSelectionView
+        files={files}
+        fileTypeLabel={typeLabels[fileType] || "个文件"}
+        Icon={Icon}
+        totalSize={totalSize}
+        importWarnings={importWarnings}
+        groupedActions={groupedActions}
+        runtime={runtime}
+        isDragOver={isDragOver}
+        state={state}
+        onReset={onReset}
+        onToggleActionPanel={handleToggleActionPanel}
+        onRunAction={(actionId) => {
+          void startBatch(actionId);
+        }}
+        onGifConvert={(fps, width, startTime, duration) => {
+          void startBatch(ACTION_IDS.VID_GIF, {
+            gifFps: fps,
+            gifWidth: width,
+            gifStartTime: startTime,
+            gifDuration: duration,
+          });
+        }}
+        onCompress={(quality, maxResolution) => {
+          void startBatch(ACTION_IDS.VID_COMPRESS, {
+            compressQuality: quality,
+            compressMaxResolution: maxResolution,
+          });
+        }}
+        onImageConvert={(quality) => {
+          void handleImageConvert(quality);
+        }}
+        onInstallDependency={(pkg) => {
+          void handleDependencyInstall(pkg);
+        }}
+        onImportDownloadedModel={() => {
+          void handleModelImport();
+        }}
+        onRetryModelDetection={() => {
+          void handleRetryModelDetection();
+        }}
+        selectedModel={preferredModel}
+        effectiveModel={effectiveModel}
+        selectedLanguage={preferredLanguage}
+        preferMixedLanguageMode={preferMixedLanguageMode}
+        onModelChange={setPreferredModel}
+        onLanguageChange={setPreferredLanguage}
+        onMixedLanguageModeChange={setPreferMixedLanguageMode}
+      />
     );
   }
 
-  if (phase === "converting") {
-    const completedCount = results.filter((result) =>
-      ["success", "error", "skipped", "cancelled"].includes(result.status),
-    ).length;
-    const totalProgress =
-      files.length > 0
-        ? ((completedCount + (currentFileProgress ?? 0) / 100) / files.length) * 100
-        : 0;
-    const currentFile =
-      currentIndex != null && currentIndex < files.length ? files[currentIndex] : null;
-    const currentStageLabel = formatProgressStage(currentStage);
-    const currentTimeRange = formatProgressTimeRange(currentSeconds, totalSeconds);
-    const currentPercentLabel = currentProgressIndeterminate
-      ? null
-      : formatPercent(currentFileProgress);
-    const currentMeta = [currentStageLabel, currentPercentLabel, currentTimeRange].filter(
-      Boolean,
-    );
-
+  if (state.phase === "converting") {
     return (
-      <div className="animate-fade-up w-full max-w-lg">
-        <div className="glass p-8 rounded-2xl text-center">
-          <Loader2 size={40} className="spin-slow text-accent mx-auto mb-5" />
-          <h2 className="text-lg font-semibold text-white/90 mb-1">
-            批量处理中...
-          </h2>
-          <p className="text-sm text-white/50">
-            {completedCount} / {files.length}
-            {currentFile && (
-              <span className="text-white/30 ml-2">· {currentFile.name}</span>
-            )}
-          </p>
-
-          <div className="mt-5 h-2 rounded-full bg-white/5 overflow-hidden">
-            <div
-              className="h-full bg-accent rounded-full transition-all duration-300"
-              style={{ width: `${Math.max(0, Math.min(100, totalProgress))}%` }}
-            />
-          </div>
-
-          <p className="text-xs text-white/25 mt-4">{currentMessage}</p>
-          {currentMeta.length > 0 && (
-            <p className="text-xs text-white/35 mt-1 font-mono">
-              当前文件 {currentMeta.join(" · ")}
-            </p>
-          )}
-
-          {results.some((result) => result.status !== "pending") && (
-            <div className="mt-4 max-h-40 overflow-y-auto space-y-1 text-left">
-              {results
-                .filter((result) => result.status !== "pending")
-                .map((result) => (
-                  <div
-                    key={result.file.path}
-                    className="flex items-center gap-2 text-xs px-1"
-                  >
-                    {result.status === "success" || result.status === "skipped" ? (
-                      <CheckCircle2
-                        size={12}
-                        className="text-success shrink-0"
-                      />
-                    ) : result.status === "running" ? (
-                      <Loader2 size={12} className="spin-slow text-accent shrink-0" />
-                    ) : (
-                      <XCircle size={12} className="text-danger shrink-0" />
-                    )}
-                    <span className="truncate text-white/40">{result.file.name}</span>
-                    <span className="shrink-0 text-white/25 ml-auto">
-                      {buildStatusLabel(result)}
-                    </span>
-                  </div>
-                ))}
-            </div>
-          )}
-
-          <button
-            onClick={() => {
-              stopAfterCurrentRef.current = true;
-              setStopRequested(true);
-            }}
-            disabled={stopRequested}
-            className={`no-drag mt-5 px-5 py-2 rounded-xl text-sm transition-colors ${
-              stopRequested
-                ? "cursor-not-allowed bg-warning/10 text-warning"
-                : "cursor-pointer text-white/40 hover:text-white/60 hover:bg-white/5"
-            }`}
-          >
-            {stopRequested ? "已请求：当前文件完成后停止" : "处理完当前文件后停止"}
-          </button>
-        </div>
-      </div>
+      <BatchProgressView
+        files={files}
+        results={state.results}
+        progress={state.progress}
+        stopRequested={state.stopRequested}
+        buildStatusLabel={buildStatusLabel}
+        onRequestStop={handleRequestStop}
+      />
     );
   }
-
-  const firstOutputDir = successResults[0]?.result?.output_path
-    .split("/")
-    .slice(0, -1)
-    .join("/");
 
   return (
-    <div className="animate-fade-up w-full max-w-lg">
-      <div className="glass p-8 rounded-2xl text-center">
-        <div
-          className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-5 ${
-            completionState === "stopped" ? "bg-warning-dim" : "bg-success-dim"
-          }`}
-        >
-          {completionState === "stopped" ? (
-            <AlertTriangle size={28} className="text-warning" />
-          ) : (
-            <CheckCircle2 size={32} className="text-success" />
-          )}
-        </div>
-
-        <h2 className="text-lg font-semibold text-white/90 mb-1">
-          {completionState === "stopped" ? "批量处理已停止" : "批量处理完成"}
-        </h2>
-        <p className="text-sm text-white/50">
-          {successResults.length > 0 && (
-            <span className="text-success">{successResults.length} 成功</span>
-          )}
-          {failedResults.length > 0 && (
-            <span className="text-danger ml-2">{failedResults.length} 失败</span>
-          )}
-          {skippedResults.length > 0 && (
-            <span className="text-white/35 ml-2">{skippedResults.length} 跳过</span>
-          )}
-          {cancelledResults.length > 0 && (
-            <span className="text-warning ml-2">{cancelledResults.length} 未执行</span>
-          )}
-        </p>
-
-        {successResults.length > 0 && (
-          <div className="mt-2 flex items-center justify-center gap-2 text-xs text-white/35">
-            <span>{formatSize(totalSize)}</span>
-            <span>&rarr;</span>
-            <span
-              className={
-                totalOutputSize < totalSize ? "text-success" : "text-white/50"
-              }
-            >
-              {formatSize(totalOutputSize)}
-            </span>
-            {totalOutputSize < totalSize && (
-              <span className="text-success">
-                (-{Math.round(((totalSize - totalOutputSize) / totalSize) * 100)}%)
-              </span>
-            )}
-          </div>
-        )}
-
-        <div
-          className="mt-4 glass p-3 rounded-xl text-left max-h-48 overflow-y-auto cursor-grab active:cursor-grabbing select-none transition-colors hover:ring-1 hover:ring-accent/20"
-          onMouseDown={() => {
-            void handleDragAllOut();
-          }}
-        >
-          <div className="space-y-1.5">
-            {results.map((result) => (
-              <div key={result.file.path} className="flex items-center gap-2 text-xs">
-                {result.status === "success" || result.status === "skipped" ? (
-                  <CheckCircle2 size={12} className="text-success shrink-0" />
-                ) : result.status === "cancelled" ? (
-                  <AlertTriangle size={12} className="text-warning shrink-0" />
-                ) : (
-                  <XCircle size={12} className="text-danger shrink-0" />
-                )}
-                <span className="truncate flex-1 min-w-0 text-white/50">
-                  {result.file.name}
-                </span>
-                <span
-                  className={`shrink-0 truncate max-w-[140px] ${
-                    result.status === "error"
-                      ? "text-danger/60"
-                      : result.status === "cancelled"
-                        ? "text-warning/70"
-                        : "text-white/25"
-                  }`}
-                >
-                  {buildStatusLabel(result)}
-                </span>
-              </div>
-            ))}
-          </div>
-          {successResults.length > 0 && (
-            <div className="flex items-center justify-center gap-1 mt-2 text-[10px] text-white/15">
-              <GripVertical size={10} />
-              <span>拖拽到其他应用</span>
-            </div>
-          )}
-        </div>
-
-        <div className="mt-6 flex flex-wrap gap-3 justify-center">
-          {firstOutputDir && (
-            <button
-              onClick={() => revealInFinder(firstOutputDir)}
-              className="no-drag flex items-center gap-2 px-5 py-2.5 rounded-xl bg-accent/15 text-accent text-sm font-medium hover:bg-accent/25 transition-colors cursor-pointer"
-            >
-              <FolderOpen size={15} />
-              在 Finder 中显示
-            </button>
-          )}
-          {failedResults.length > 0 && lastRunContext && (
-            <button
-              onClick={() => {
-                void retryFailedItems();
-              }}
-              className="no-drag flex items-center gap-2 px-5 py-2.5 rounded-xl bg-danger/10 text-danger text-sm font-medium hover:bg-danger/20 transition-colors cursor-pointer"
-            >
-              <RotateCcw size={15} />
-              重试失败项
-            </button>
-          )}
-          {cancelledResults.length > 0 && lastRunContext && (
-            <button
-              onClick={() => {
-                void continueRemainingItems();
-              }}
-              className="no-drag flex items-center gap-2 px-5 py-2.5 rounded-xl bg-warning/10 text-warning text-sm font-medium hover:bg-warning/20 transition-colors cursor-pointer"
-            >
-              <RotateCcw size={15} />
-              继续剩余项
-            </button>
-          )}
-        </div>
-
-        <button
-          onClick={onReset}
-          className="no-drag mt-4 flex items-center gap-1.5 mx-auto text-xs text-white/30 hover:text-white/50 transition-colors cursor-pointer"
-        >
-          <RotateCcw size={12} />
-          处理新文件
-        </button>
-      </div>
-    </div>
+    <BatchResultView
+      results={state.results}
+      totalSize={totalSize}
+      completionState={state.completionState}
+      buildStatusLabel={buildStatusLabel}
+      onRevealOutputDir={revealInFinder}
+      onRetryFailedItems={() => {
+        void retryFailedItems();
+      }}
+      onContinueRemainingItems={() => {
+        void continueRemainingItems();
+      }}
+      onDragAllOut={() => {
+        void handleDragAllOut();
+      }}
+      onReset={onReset}
+      hasLastRunContext={state.lastRunContext !== null}
+    />
   );
 }

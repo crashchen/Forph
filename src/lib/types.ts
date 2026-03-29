@@ -1,3 +1,5 @@
+import type { ActionId } from "./actionIds";
+
 export interface FileInfo {
   name: string;
   path: string;
@@ -10,7 +12,7 @@ export interface FileInfo {
 }
 
 export interface FileAction {
-  id: string;
+  id: ActionId;
   label: string;
   group: string;
 }
@@ -44,6 +46,13 @@ export interface RuntimeInfo {
 
 export interface DependencyInstallResult {
   package_name: string;
+  message: string;
+}
+
+export interface ModelImportResult {
+  model_name: string;
+  source_path: string;
+  target_path: string;
   message: string;
 }
 
@@ -82,7 +91,7 @@ export interface ConversionProgressEvent {
 export type AppView =
   | { stage: "idle" }
   | { stage: "actions"; file: FileInfo }
-  | { stage: "converting"; file: FileInfo; actionId: string; jobId?: string }
+  | { stage: "converting"; file: FileInfo; actionId: ActionId; jobId?: string }
   | { stage: "done"; file: FileInfo; result: ConversionResult }
   | { stage: "error"; file: FileInfo; error: string }
   | {
