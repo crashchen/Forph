@@ -10,7 +10,7 @@ import type {
   TranscriptionModel,
 } from "../../lib/transcription";
 
-export type InstallableDependency = "ffmpeg" | "whisper-cpp";
+export type InstallableDependency = "ffmpeg" | "whisper-cpp" | "poppler";
 
 export interface BatchActionOptions {
   gifFps?: number;

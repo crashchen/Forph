@@ -53,13 +53,17 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
       if (event.message) {
         setMessage(event.message);
       }
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-        return;
-      }
-      unlisten = fn;
-    });
+    })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch((error: unknown) => {
+        console.error("Failed to listen for conversion progress", error);
+      });
 
     return () => {
       disposed = true;

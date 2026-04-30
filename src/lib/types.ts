@@ -5,7 +5,7 @@ export interface FileInfo {
   path: string;
   extension: string;
   size: number;
-  file_type: "image" | "video" | "audio" | "markdown" | "unknown";
+  file_type: "image" | "video" | "audio" | "markdown" | "pdf" | "unknown";
   actions: FileAction[];
   media?: MediaInfo | null;
   runtime?: RuntimeInfo | null;
@@ -35,6 +35,7 @@ export interface RuntimeInfo {
   brew_available: boolean;
   ffmpeg_available: boolean;
   ffprobe_available: boolean;
+  pdftotext_available: boolean;
   whisper_available: boolean;
   available_models: string[];
   model_directory?: string | null;

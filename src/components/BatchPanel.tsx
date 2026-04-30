@@ -24,6 +24,7 @@ import type {
 import {
   compressVideo,
   convertImage,
+  extractPdfText,
   exportMarkdown,
   extractAudio,
   getDragIcon,
@@ -83,6 +84,7 @@ const typeLabels: Record<string, string> = {
   video: "个视频",
   audio: "个音频",
   markdown: "个文档",
+  pdf: "份 PDF",
 };
 
 const TRANSCRIPTION_ACTION_IDS = new Set<ActionId>([
@@ -153,6 +155,10 @@ async function runAction(
       );
     case ACTION_IDS.MD_HTML:
       return exportMarkdown(file.path);
+    case ACTION_IDS.PDF_TXT:
+      return extractPdfText(file.path, "txt");
+    case ACTION_IDS.PDF_MD:
+      return extractPdfText(file.path, "md");
     case ACTION_IDS.VID_GIF:
       return videoToGif(
         file.path,
@@ -285,14 +291,18 @@ export function BatchPanel({
       }
 
       dispatch({ type: "progressReceived", event });
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-        return;
-      }
+    })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return;
+        }
 
-      unlisten = fn;
-    });
+        unlisten = fn;
+      })
+      .catch((error: unknown) => {
+        console.error("Failed to listen for batch conversion progress", error);
+      });
 
     return () => {
       disposed = true;

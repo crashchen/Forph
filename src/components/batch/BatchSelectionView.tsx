@@ -196,7 +196,10 @@ export function BatchSelectionView({
         />
       )}
 
-      {runtime && currentFile?.file_type !== "image" && currentFile?.file_type !== "markdown" && (
+      {runtime &&
+        currentFile?.file_type !== "image" &&
+        currentFile?.file_type !== "markdown" &&
+        currentFile?.file_type !== "pdf" && (
         <TranscriptionPreferences
           runtime={runtime}
           selectedModel={selectedModel}
@@ -211,6 +214,7 @@ export function BatchSelectionView({
 
       {runtime && (
         <DependencySection
+          fileType={currentFile?.file_type ?? "unknown"}
           runtime={runtime}
           installingDependency={state.dependency.installingDependency}
           modelImportState={state.dependency.modelImportState}

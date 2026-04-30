@@ -48,6 +48,10 @@ export function getActionDisabledReason(
     return runtime.ffmpeg_available ? null : "需要先安装 FFmpeg";
   }
 
+  if (action.id === ACTION_IDS.PDF_TXT || action.id === ACTION_IDS.PDF_MD) {
+    return runtime.pdftotext_available ? null : "需要先安装 Poppler (pdftotext)";
+  }
+
   if (
     action.id === ACTION_IDS.VID_TRANSCRIBE ||
     action.id === ACTION_IDS.AUD_TRANSCRIBE ||

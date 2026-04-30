@@ -46,6 +46,7 @@ pub struct RuntimeInfo {
     brew_available: bool,
     ffmpeg_available: bool,
     ffprobe_available: bool,
+    pdftotext_available: bool,
     whisper_available: bool,
     available_models: Vec<String>,
     model_directory: Option<String>,
@@ -272,6 +273,14 @@ fn ffprobe_command_path() -> Option<PathBuf> {
     resolve_command_path("ffprobe")
 }
 
+fn pdftotext_command_path() -> Option<PathBuf> {
+    resolve_command_path("pdftotext")
+}
+
+fn sips_command_path() -> PathBuf {
+    resolve_command_path("sips").unwrap_or_else(|| PathBuf::from("/usr/bin/sips"))
+}
+
 fn whisper_cpp_command_path() -> Option<PathBuf> {
     ["whisper-cli", "whisper-cpp"]
         .into_iter()
@@ -419,6 +428,7 @@ fn runtime_info(app: &AppHandle) -> RuntimeInfo {
         brew_available: brew_command_path().is_some(),
         ffmpeg_available: ffmpeg_command_path().is_some(),
         ffprobe_available: ffprobe_command_path().is_some(),
+        pdftotext_available: pdftotext_command_path().is_some(),
         whisper_available: whisper_cpp_command_path().is_some(),
         available_models: lookup.available_models,
         model_directory: Some(lookup.current_directory.to_string_lossy().to_string()),
@@ -517,27 +527,70 @@ fn probe_media_info(path: &str) -> Option<MediaInfo> {
     })
 }
 
-fn make_output_path(input: &str, new_ext: &str) -> PathBuf {
-    let p = Path::new(input);
-    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-    let parent = p.parent().unwrap_or(Path::new("."));
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn validate_input_file_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("文件路径不能为空。".into());
+    }
+
+    let candidate = Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return Err("只能处理本地绝对路径文件。".into());
+    }
+
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|e| format!("无法解析文件路径: {}", e))?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|e| format!("无法读取文件: {}", e))?;
+    if !metadata.is_file() {
+        return Err("只能处理本地文件。".into());
+    }
+
+    Ok(resolved)
+}
+
+fn make_output_path_for_input(input: &Path, new_ext: &str) -> Result<PathBuf, String> {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "无法从输入文件名生成输出文件名。".to_string())?;
+    let parent = input
+        .parent()
+        .ok_or_else(|| "无法确定输出目录。".to_string())?;
 
     let candidate = parent.join(format!("{}.{}", stem, new_ext));
     if !candidate.exists() {
-        return candidate;
+        return Ok(candidate);
     }
 
     for i in 1..1000 {
         let path = parent.join(format!("{}_{}.{}", stem, i, new_ext));
         if !path.exists() {
-            return path;
+            return Ok(path);
         }
     }
-    candidate
+
+    Err("无法生成不冲突的输出文件名。".into())
 }
 
-fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+fn unique_temp_file_path(prefix: &str, extension: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "{}-{}-{}.{}",
+        prefix,
+        std::process::id(),
+        unique,
+        extension
+    ))
 }
 
 fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
@@ -561,6 +614,18 @@ fn build_actions(ext: &str, file_type: &str) -> Vec<FileAction> {
             label: "导出 HTML".into(),
             group: "文档导出".into(),
         }],
+        "pdf" => vec![
+            FileAction {
+                id: "pdf_txt".into(),
+                label: "提取纯文本".into(),
+                group: "文档提取".into(),
+            },
+            FileAction {
+                id: "pdf_md".into(),
+                label: "导出 Markdown".into(),
+                group: "文档提取".into(),
+            },
+        ],
         "video" => vec![
             FileAction {
                 id: "vid_gif".into(),
@@ -749,6 +814,131 @@ fn build_markdown_document(title: &str, html_body: &str) -> String {
     )
 }
 
+fn normalize_pdf_raw_text(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|ch| {
+            matches!(*ch, '\n' | '\u{000C}' | '\t')
+                || !ch.is_control()
+        })
+        .collect()
+}
+
+fn normalize_pdf_line_whitespace(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_pdf_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+
+    if trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("• ")
+    {
+        return true;
+    }
+
+    let digit_count = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+
+    if digit_count == 0 {
+        return false;
+    }
+
+    matches!(
+        trimmed.chars().nth(digit_count),
+        Some('.') | Some(')')
+    ) && trimmed
+        .chars()
+        .nth(digit_count + 1)
+        .map(|ch| ch.is_whitespace())
+        .unwrap_or(false)
+}
+
+fn flush_pdf_paragraph_block(lines: &[String]) -> Option<String> {
+    let mut rebuilt = Vec::new();
+    let mut prose = String::new();
+
+    for line in lines {
+        if is_pdf_list_item(line) {
+            if !prose.is_empty() {
+                rebuilt.push(prose.trim().to_string());
+                prose.clear();
+            }
+            rebuilt.push(line.to_string());
+            continue;
+        }
+
+        if prose.is_empty() {
+            prose.push_str(line);
+        } else {
+            prose.push(' ');
+            prose.push_str(line);
+        }
+    }
+
+    if !prose.is_empty() {
+        rebuilt.push(prose.trim().to_string());
+    }
+
+    let paragraph = rebuilt
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (!paragraph.is_empty()).then_some(paragraph)
+}
+
+fn clean_pdf_page_text(page: &str) -> String {
+    let mut paragraphs = Vec::new();
+    let mut current_lines = Vec::new();
+
+    for raw_line in page.lines() {
+        let line = normalize_pdf_line_whitespace(raw_line);
+        if line.is_empty() {
+            if let Some(paragraph) = flush_pdf_paragraph_block(&current_lines) {
+                paragraphs.push(paragraph);
+            }
+            current_lines.clear();
+            continue;
+        }
+
+        current_lines.push(line);
+    }
+
+    if let Some(paragraph) = flush_pdf_paragraph_block(&current_lines) {
+        paragraphs.push(paragraph);
+    }
+
+    paragraphs.join("\n\n")
+}
+
+fn extract_clean_pdf_pages(raw: &str) -> Vec<(usize, String)> {
+    normalize_pdf_raw_text(raw)
+        .split('\u{000C}')
+        .enumerate()
+        .filter_map(|(index, page)| {
+            let cleaned = clean_pdf_page_text(page);
+            (!cleaned.is_empty()).then_some((index + 1, cleaned))
+        })
+        .collect()
+}
+
+fn build_pdf_markdown_document(title: &str, pages: &[(usize, String)]) -> String {
+    let normalized_title = title.replace(['\r', '\n'], " ");
+    let mut output = format!("# {}\n", normalized_title.trim());
+
+    for (page_number, page_text) in pages {
+        output.push_str(&format!("\n## Page {}\n\n{}\n", page_number, page_text));
+    }
+
+    output.trim_end().to_string() + "\n"
+}
+
 fn clamp_gif_window(
     start_time: Option<f64>,
     duration: Option<f64>,
@@ -902,6 +1092,7 @@ fn validate_open_target_request(
 fn dependency_is_installed(package_name: &str) -> bool {
     match package_name {
         "ffmpeg" => has_command("ffmpeg"),
+        "poppler" => pdftotext_command_path().is_some(),
         "whisper-cpp" => whisper_cpp_command_path().is_some(),
         _ => false,
     }
@@ -910,6 +1101,7 @@ fn dependency_is_installed(package_name: &str) -> bool {
 fn dependency_display_name(package_name: &str) -> Option<&'static str> {
     match package_name {
         "ffmpeg" => Some("FFmpeg"),
+        "poppler" => Some("Poppler (pdftotext)"),
         "whisper-cpp" => Some("whisper-cpp"),
         _ => None,
     }
@@ -1355,7 +1547,7 @@ fn format_vtt_timestamp(milliseconds: u64) -> String {
 
 fn parse_timestamp_range(line: &str) -> Option<(u64, u64)> {
     let (start, end) = line.split_once("-->")?;
-    let end_token = end.trim().split_whitespace().next()?;
+    let end_token = end.split_whitespace().next()?;
     Some((parse_timestamp_ms(start.trim())?, parse_timestamp_ms(end_token)?))
 }
 
@@ -1662,12 +1854,12 @@ fn run_whisper_language_detection(
 
 fn parse_silencedetect_event_line(line: &str) -> Option<SilenceEvent> {
     if let Some((_, value)) = line.split_once("silence_start:") {
-        let seconds = value.trim().split_whitespace().next()?.parse::<f64>().ok()?;
+        let seconds = value.split_whitespace().next()?.parse::<f64>().ok()?;
         return Some(SilenceEvent::Start(seconds_to_millis(seconds)));
     }
 
     if let Some((_, value)) = line.split_once("silence_end:") {
-        let seconds = value.trim().split_whitespace().next()?.parse::<f64>().ok()?;
+        let seconds = value.split_whitespace().next()?.parse::<f64>().ok()?;
         return Some(SilenceEvent::End(seconds_to_millis(seconds)));
     }
 
@@ -1910,6 +2102,7 @@ fn extract_segment_audio(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mixed_language_transcription(
     reporter: &ProgressReporter,
     ffmpeg: &Path,
@@ -2076,6 +2269,7 @@ fn get_file_info(app: AppHandle, path: String) -> Result<FileInfo, String> {
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" => "video",
         "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac" | "wma" => "audio",
         "md" | "markdown" | "mdown" => "markdown",
+        "pdf" => "pdf",
         _ => "unknown",
     }
     .to_string();
@@ -2086,7 +2280,7 @@ fn get_file_info(app: AppHandle, path: String) -> Result<FileInfo, String> {
         _ => None,
     };
     let runtime = match file_type.as_str() {
-        "video" | "audio" => Some(runtime_info(&app)),
+        "video" | "audio" | "pdf" => Some(runtime_info(&app)),
         _ => None,
     };
 
@@ -2108,20 +2302,22 @@ async fn convert_image(
     output_format: String,
     quality: Option<u8>,
 ) -> Result<ConversionResult, String> {
-    let ext = Path::new(&input_path)
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
+    let ext = input
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    let out = make_output_path(&input_path, &output_format);
+    let out = make_output_path_for_input(&input, &output_format)?;
     let out_str = out.to_string_lossy().to_string();
 
     if ext == "heic" || ext == "heif" {
         match output_format.as_str() {
             "jpg" | "jpeg" => {
                 let q_str = quality.unwrap_or(85).to_string();
-                let r = StdCommand::new("sips")
+                let r = command_with_augmented_path(sips_command_path())
                     .args([
                         "-s",
                         "format",
@@ -2143,7 +2339,7 @@ async fn convert_image(
                 }
             }
             "png" => {
-                let r = StdCommand::new("sips")
+                let r = command_with_augmented_path(sips_command_path())
                     .args(["-s", "format", "png", &input_path, "--out", &out_str])
                     .output()
                     .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -2155,9 +2351,9 @@ async fn convert_image(
                 }
             }
             "webp" => {
-                let tmp_png = make_output_path(&input_path, "tmp.png");
+                let tmp_png = unique_temp_file_path("forph-heic", "png");
                 let tmp_str = tmp_png.to_string_lossy().to_string();
-                let r = StdCommand::new("sips")
+                let r = command_with_augmented_path(sips_command_path())
                     .args(["-s", "format", "png", &input_path, "--out", &tmp_str])
                     .output()
                     .map_err(|e| format!("sips 调用失败: {}", e))?;
@@ -2167,10 +2363,13 @@ async fn convert_image(
                         String::from_utf8_lossy(&r.stderr)
                     ));
                 }
-                let img =
-                    image::open(&tmp_png).map_err(|e| format!("读取临时 PNG 失败: {}", e))?;
-                save_image_with_quality(&img, &out, "webp", quality)?;
+                let result = (|| {
+                    let img =
+                        image::open(&tmp_png).map_err(|e| format!("读取临时 PNG 失败: {}", e))?;
+                    save_image_with_quality(&img, &out, "webp", quality)
+                })();
                 let _ = std::fs::remove_file(&tmp_png);
+                result?;
             }
             _ => return Err(format!("不支持的输出格式: {}", output_format)),
         }
@@ -2188,24 +2387,98 @@ async fn convert_image(
 
 #[tauri::command]
 async fn export_markdown(input_path: String) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
     let raw_content =
         std::fs::read_to_string(&input_path).map_err(|e| format!("无法读取文件: {}", e))?;
     let content = strip_frontmatter(&raw_content);
 
-    let title = Path::new(&input_path)
+    let title = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Document");
 
     let html_body = render_markdown(content);
     let full_html = build_markdown_document(title, &html_body);
-    let out = make_output_path(&input_path, "html");
+    let out = make_output_path_for_input(&input, "html")?;
     std::fs::write(&out, &full_html).map_err(|e| format!("写入失败: {}", e))?;
 
     Ok(ConversionResult {
         output_path: out.to_string_lossy().to_string(),
         output_size: file_size(&out),
         message: "HTML 导出完成".into(),
+    })
+}
+
+#[tauri::command]
+async fn extract_pdf_text(
+    input_path: String,
+    output_format: String,
+) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
+    let (extension, message) = match output_format.as_str() {
+        "txt" => ("txt", "PDF 纯文本提取完成"),
+        "md" => ("md", "PDF Markdown 导出完成"),
+        _ => return Err("PDF 仅支持导出 TXT 或 Markdown。".into()),
+    };
+
+    let Some(pdftotext) = pdftotext_command_path() else {
+        return Err("需要安装 Poppler (pdftotext)".into());
+    };
+    let input_path_for_extract = input_path.clone();
+
+    let title = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Document");
+
+    let extraction_output = tauri::async_runtime::spawn_blocking(move || {
+        command_with_augmented_path(pdftotext)
+            .args(["-enc", "UTF-8", "-eol", "unix", "-q"])
+            .arg(&input_path_for_extract)
+            .arg("-")
+            .output()
+    })
+    .await
+    .map_err(|error| format!("PDF 提取任务执行失败: {}", error))?
+    .map_err(|error| format!("调用 pdftotext 失败: {}", error))?;
+
+    if !extraction_output.status.success() {
+        let stderr = String::from_utf8_lossy(&extraction_output.stderr)
+            .trim()
+            .to_string();
+        let details = if stderr.is_empty() {
+            "文件可能已加密、损坏，或当前系统无法读取它的文本层。".into()
+        } else {
+            stderr
+        };
+        return Err(format!("PDF 文本提取失败：{}", details));
+    }
+
+    let raw_text = String::from_utf8_lossy(&extraction_output.stdout).to_string();
+    let pages = extract_clean_pdf_pages(&raw_text);
+    if pages.is_empty() {
+        return Err("该 PDF 没有可提取文本层，可能是扫描件；v1 暂不支持 OCR。".into());
+    }
+
+    let output_text = match extension {
+        "txt" => pages
+            .iter()
+            .map(|(_, page)| page.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        "md" => build_pdf_markdown_document(title, &pages),
+        _ => unreachable!("PDF output format is validated above"),
+    };
+
+    let out = make_output_path_for_input(&input, extension)?;
+    std::fs::write(&out, output_text).map_err(|e| format!("写入失败: {}", e))?;
+
+    Ok(ConversionResult {
+        output_path: out.to_string_lossy().to_string(),
+        output_size: file_size(&out),
+        message: message.into(),
     })
 }
 
@@ -2219,6 +2492,8 @@ async fn video_to_gif(
     duration: Option<f64>,
     job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
     };
@@ -2230,7 +2505,7 @@ async fn video_to_gif(
         media.as_ref().and_then(|info| info.duration_seconds),
     );
 
-    let out = make_output_path(&input_path, "gif");
+    let out = make_output_path_for_input(&input, "gif")?;
     let out_str = out.to_string_lossy().to_string();
 
     let scale_filter = if width > 0 {
@@ -2297,12 +2572,14 @@ async fn extract_audio(
     output_format: String,
     job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
     };
 
     let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
-    let out = make_output_path(&input_path, &output_format);
+    let out = make_output_path_for_input(&input, &output_format)?;
     let out_str = out.to_string_lossy().to_string();
 
     let args: Vec<String> = match output_format.as_str() {
@@ -2369,6 +2646,8 @@ async fn compress_video(
     max_resolution: Option<String>,
     job_id: Option<String>,
 ) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
     let Some(ffmpeg) = ffmpeg_command_path() else {
         return Err("需要安装 FFmpeg".into());
     };
@@ -2381,7 +2660,7 @@ async fn compress_video(
         _ => "23",
     };
 
-    let out = make_output_path(&input_path, "mp4");
+    let out = make_output_path_for_input(&input, "mp4")?;
     let out_str = out.to_string_lossy().to_string();
 
     let mut args: Vec<String> = vec![
@@ -2455,6 +2734,8 @@ async fn transcribe_audio(
     job_id: Option<String>,
     mixed_language_mode: Option<bool>,
 ) -> Result<ConversionResult, String> {
+    let input = validate_input_file_path(&input_path)?;
+    let input_path = input.to_string_lossy().to_string();
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp".into());
     };
@@ -2475,7 +2756,7 @@ async fn transcribe_audio(
     };
 
     let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
-    let tmp_wav = make_output_path(&input_path, "tmp_whisper.wav");
+    let tmp_wav = unique_temp_file_path("forph-whisper", "wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
     let fmt = output_format.unwrap_or_else(|| "txt".to_string());
@@ -2485,7 +2766,7 @@ async fn transcribe_audio(
         _ => ("-otxt", "txt"),
     };
 
-    let out = make_output_path(&input_path, file_ext);
+    let out = make_output_path_for_input(&input, file_ext)?;
     let out_str = out.to_string_lossy().to_string();
     let of_base = out_str
         .strip_suffix(&format!(".{}", file_ext))
@@ -2740,6 +3021,7 @@ pub fn run() {
             get_file_info,
             convert_image,
             export_markdown,
+            extract_pdf_text,
             video_to_gif,
             compress_video,
             extract_audio,
@@ -2757,13 +3039,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_markdown_document, clamp_gif_window, compression_scale_filter, escape_html_text,
-        find_downloaded_model_candidate_in_dir, max_long_edge_for_resolution,
-        merge_srt_outputs, merge_vtt_outputs, normalize_detected_language_label,
-        normalize_speech_segments, normalized_transcription_language,
-        parse_detected_language, parse_ffmpeg_progress_line, parse_silencedetect_event_line,
-        parse_whisper_progress_percent, speech_segment, strip_frontmatter,
-        validate_existing_local_target, validate_open_target_request, FfmpegProgressUpdate,
+        build_markdown_document, build_pdf_markdown_document, clamp_gif_window,
+        clean_pdf_page_text, compression_scale_filter, escape_html_text,
+        extract_clean_pdf_pages, find_downloaded_model_candidate_in_dir,
+        is_pdf_list_item, max_long_edge_for_resolution, merge_srt_outputs, merge_vtt_outputs,
+        normalize_detected_language_label, normalize_pdf_raw_text, normalize_speech_segments,
+        normalized_transcription_language, parse_detected_language, parse_ffmpeg_progress_line,
+        parse_silencedetect_event_line, parse_whisper_progress_percent, speech_segment,
+        strip_frontmatter, validate_existing_local_target, validate_input_file_path,
+        validate_open_target_request, make_output_path_for_input, FfmpegProgressUpdate,
         SilenceEvent, ValidatedOpenTarget,
     };
     use std::{
@@ -2814,6 +3098,87 @@ mod tests {
     fn keeps_yaml_values_that_contain_delimiters() {
         let content = "---\ntitle: a --- b\nsummary: still yaml\n---\n# Title\n";
         assert_eq!(strip_frontmatter(content), "# Title\n");
+    }
+
+    #[test]
+    fn validates_absolute_existing_input_files() {
+        let temp_file = temp_test_path("input-file");
+        fs::write(&temp_file, b"demo").expect("write input");
+
+        assert_eq!(
+            validate_input_file_path(temp_file.to_string_lossy().as_ref()),
+            Ok(temp_file.canonicalize().expect("canonicalize input"))
+        );
+
+        let _ = fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn rejects_relative_input_paths() {
+        assert!(validate_input_file_path("relative.pdf").is_err());
+    }
+
+    #[test]
+    fn builds_non_conflicting_output_paths() {
+        let temp_dir = temp_test_path("output-dir");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let input = temp_dir.join("demo.pdf");
+        let first = temp_dir.join("demo.txt");
+        fs::write(&input, b"pdf").expect("write input");
+        fs::write(&first, b"existing").expect("write first output");
+
+        assert_eq!(
+            make_output_path_for_input(&input, "txt").expect("output path"),
+            temp_dir.join("demo_1.txt")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn normalizes_pdf_raw_text_to_unix_newlines() {
+        let raw = "A\r\nB\rC\u{0007}\u{000C}D\tE";
+        assert_eq!(normalize_pdf_raw_text(raw), "A\nB\nC\u{000C}D\tE");
+    }
+
+    #[test]
+    fn preserves_pdf_list_lines_while_joining_prose() {
+        let page = "First line\nsecond line\n\n- item one\n- item two\n\nTail\nline";
+        assert_eq!(
+            clean_pdf_page_text(page),
+            "First line second line\n\n- item one\n- item two\n\nTail line"
+        );
+    }
+
+    #[test]
+    fn recognizes_numbered_pdf_list_items() {
+        assert!(is_pdf_list_item("1. First"));
+        assert!(is_pdf_list_item("12) Second"));
+        assert!(!is_pdf_list_item("2024 report"));
+    }
+
+    #[test]
+    fn extracts_clean_pdf_pages_and_skips_empty_ones() {
+        let raw = "Page one line 1\nline 2\u{000C}\n\n\u{000C}Page three";
+        assert_eq!(
+            extract_clean_pdf_pages(raw),
+            vec![
+                (1, "Page one line 1 line 2".into()),
+                (3, "Page three".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_pdf_markdown_with_page_headings() {
+        let document = build_pdf_markdown_document(
+            "Demo",
+            &[(1, "First page".into()), (3, "Third page".into())],
+        );
+        assert_eq!(
+            document,
+            "# Demo\n\n## Page 1\n\nFirst page\n\n## Page 3\n\nThird page\n"
+        );
     }
 
     #[test]

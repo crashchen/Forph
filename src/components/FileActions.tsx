@@ -17,6 +17,7 @@ import type {
 import {
   compressVideo,
   convertImage,
+  extractPdfText,
   exportMarkdown,
   extractAudio,
   getFileInfo,
@@ -239,6 +240,10 @@ export function FileActions({
 
         if (action.id === ACTION_IDS.MD_HTML) {
           result = await exportMarkdown(file.path);
+        } else if (action.id === ACTION_IDS.PDF_TXT) {
+          result = await extractPdfText(file.path, "txt");
+        } else if (action.id === ACTION_IDS.PDF_MD) {
+          result = await extractPdfText(file.path, "md");
         } else if (action.id === ACTION_IDS.VID_MP3 || action.id === ACTION_IDS.AUD_MP3) {
           result = await extractAudio(file.path, "mp3", jobId);
         } else if (action.id === ACTION_IDS.VID_WAV || action.id === ACTION_IDS.AUD_WAV) {
@@ -602,6 +607,7 @@ export function FileActions({
 
       {runtime && (
         <DependencySection
+          fileType={file.file_type}
           runtime={runtime}
           installingDependency={installingDependency}
           modelImportState={modelImportState}

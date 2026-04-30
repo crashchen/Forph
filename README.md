@@ -10,6 +10,7 @@ Forph 是一个 macOS 本地文件转换器，主打拖拽即处理、文件本�
 
 - 图片转换：输入支持 `JPG / PNG / WEBP / HEIC / HEIF / BMP / TIFF`，输出支持 `JPG / PNG / WEBP`
 - Markdown 导出：`HTML`
+- PDF 文本提取：文本型 PDF 导出 `TXT / Markdown`
 - 视频处理：压缩视频（H.264，可选画质和最大分辨率）、转 GIF、提取音频（MP3 / WAV）、离线转写、转写字幕（SRT / VTT）
 - 音频处理：转 MP3 / WAV、离线转写、转写字幕（SRT / VTT）
 - 批量处理：拖入多个文件后自动容错归组，一次选择操作批量转换，进度和结果逐条显示
@@ -78,15 +79,16 @@ git push origin v0.1.0
 以下能力依赖系统工具，未安装时会在对应操作里提示或禁用对应动作：
 
 - `ffmpeg` + `ffprobe`：视频压缩、转 GIF、提取音频、媒体信息读取，以及所有音视频转写前处理
+- `poppler`：文本型 PDF 的文字提取，Forph 当前使用其中的 `pdftotext`
 - `whisper-cpp`：本地音视频转写
 - 在 Homebrew 环境里，`whisper-cpp` 常见的实际可执行名是 `whisper-cli`
-- 如果系统里已经有 Homebrew，Forph 会在动作页直接给 `一键安装 FFmpeg` / `一键安装 whisper-cpp`
+- 如果系统里已经有 Homebrew，Forph 会在动作页直接给 `一键安装 FFmpeg` / `一键安装 Poppler` / `一键安装 whisper-cpp`
 - 如果还没有 Homebrew，动作页会给官网入口，先装好 Homebrew 再回来点一次即可
 
 示例：
 
 ```bash
-brew install ffmpeg whisper-cpp
+brew install ffmpeg poppler whisper-cpp
 ```
 
 ## Notes
@@ -105,6 +107,9 @@ brew install ffmpeg whisper-cpp
 - `ggml-base.bin`、`ggml-small.bin`、`ggml-medium.bin` 都是模型数据文件，不是可双击安装的程序；如果它们已经在 `Downloads` 里，直接点“从下载目录导入”即可。
 - 转写语言支持 `自动检测 / 中文 / English / Deutsch / Français / Español / 日本語 / 한국어`，`.txt / .srt / .vtt` 三种输出都会复用同一套模型和语言偏好。
 - “混合语种模式”默认关闭，并且只在“自动检测”下生效。它会先按停顿切段，再逐段检测语言并分别转写，最后用绝对时间轴合并成最终的 `.txt / .srt / .vtt`，更适合中德、中英这类长音频混合语种场景。
+- PDF v1 只支持“文本层 PDF -> TXT / Markdown”。它会尽量清理软换行、连续空格和空白噪声，让导出的语料更适合 AI 总结、检索和切块。
+- PDF Markdown 输出是保守包装：`# 文件名` + `## Page N` + 清洗后的页文本，不尝试高保真还原原始版式。
+- 扫描件、图片型 PDF、复杂多栏和表格重建都不在当前范围内；如果 PDF 没有文本层，界面会明确提示当前版本暂不支持 OCR。
 - 当前主模型目录会跟随 bundle identifier 走到应用数据目录，也就是类似 `~/Library/Application Support/com.crashchen.forph/models/`。
 - 旧目录 `~/Library/Application Support/Forph/models/` 和 `~/Library/Application Support/com.forph.app/models/` 仍会被兼容读取，但不会自动清理。
 - 为了兼容从 Finder 直接启动的 GUI 环境，应用会优先尝试 Homebrew 常见路径，而不是只依赖终端里的 `PATH`。

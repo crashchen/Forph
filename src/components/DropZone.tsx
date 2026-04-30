@@ -16,6 +16,7 @@ export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
           extensions: [
             "jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "tiff", "tif",
             "md", "markdown", "mdown",
+            "pdf",
             "mp4", "mov", "avi", "mkv", "webm", "m4v",
             "mp3", "wav", "m4a", "aac", "ogg", "flac", "wma",
           ],
@@ -66,7 +67,7 @@ export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
           {isDragOver ? "松手即可处理" : "拖入文件，剩下的交给我"}
         </h2>
         <p className="text-sm text-white/40 mb-6">
-          支持图片 / Markdown / 视频 / 音频
+          支持图片 / Markdown / PDF / 视频 / 音频
         </p>
 
         <button
@@ -82,7 +83,7 @@ export function DropZone({ isDragOver, onFileDrop }: DropZoneProps) {
 
       {/* Supported formats hint */}
       <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
-        {["JPG", "PNG", "WEBP", "HEIC", "MD", "MP4", "MP3", "WAV"].map(
+        {["JPG", "PNG", "WEBP", "HEIC", "MD", "PDF", "MP4", "MP3", "WAV"].map(
           (fmt) => (
             <span
               key={fmt}

@@ -58,6 +58,13 @@ export async function exportMarkdown(
   return invoke("export_markdown", { inputPath });
 }
 
+export async function extractPdfText(
+  inputPath: string,
+  outputFormat: "txt" | "md",
+): Promise<ConversionResult> {
+  return invoke("extract_pdf_text", { inputPath, outputFormat });
+}
+
 export async function videoToGif(
   inputPath: string,
   fps: number,
@@ -121,7 +128,7 @@ export async function transcribeAudio(
 }
 
 export async function installDependency(
-  packageName: "ffmpeg" | "whisper-cpp",
+  packageName: "ffmpeg" | "whisper-cpp" | "poppler",
 ): Promise<DependencyInstallResult> {
   return invoke("install_dependency", { packageName });
 }
