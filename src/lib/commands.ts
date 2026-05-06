@@ -127,6 +127,10 @@ export async function transcribeAudio(
   });
 }
 
+export async function cancelJob(jobId: string): Promise<void> {
+  return invoke("cancel_job", { jobId });
+}
+
 export async function installDependency(
   packageName: "ffmpeg" | "whisper-cpp" | "poppler",
 ): Promise<DependencyInstallResult> {

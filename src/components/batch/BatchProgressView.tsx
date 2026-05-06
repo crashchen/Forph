@@ -118,7 +118,7 @@ export function BatchProgressView({
               : "cursor-pointer text-white/40 hover:text-white/60 hover:bg-white/5"
           }`}
         >
-          {stopRequested ? "已请求：当前文件完成后停止" : "处理完当前文件后停止"}
+          {stopRequested ? "正在取消当前文件..." : "取消当前文件并停止剩余项"}
         </button>
       </div>
     </div>

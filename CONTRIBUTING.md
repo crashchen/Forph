@@ -36,6 +36,7 @@ npx tauri dev
 npm run build
 npm run lint
 cd src-tauri && cargo test
+cd src-tauri && cargo clippy -- -D warnings
 ```
 
 如果改动涉及桌面打包或 Tauri 配置，建议额外验证：

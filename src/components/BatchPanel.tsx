@@ -14,45 +14,26 @@ import {
   isImageActionId,
   type ActionId,
 } from "../lib/actionIds";
-import type {
-  BatchFileResult,
-  BatchImportSummary,
-  ConversionProgressEvent,
-  FileAction,
-  FileInfo,
-} from "../lib/types";
+import type { BatchFileResult, BatchImportSummary, FileAction, FileInfo } from "../lib/types";
 import {
-  compressVideo,
-  convertImage,
-  extractPdfText,
-  exportMarkdown,
-  extractAudio,
   getDragIcon,
   getFileInfo,
   importDownloadedModel,
   installDependency,
-  listenConversionProgress,
   revealInFinder,
-  transcribeAudio,
-  videoToGif,
 } from "../lib/commands";
 import { getErrorMessage } from "../lib/errors";
-import {
-  actionUsesRealtimeProgress,
-  getBatchActions,
-  shouldSkipBatchAction,
-} from "../lib/actions";
+import { getBatchActions } from "../lib/actions";
 import { BatchProgressView } from "./batch/BatchProgressView";
 import { BatchResultView } from "./batch/BatchResultView";
 import { BatchSelectionView } from "./batch/BatchSelectionView";
 import {
   batchPanelReducer,
-  buildInitialResults,
   createInitialBatchState,
   type BatchActionOptions,
-  type BatchRunContext,
   type InstallableDependency,
 } from "./batch/batchState";
+import { useBatchRunner } from "./batch/useBatchRunner";
 import { formatSize } from "../lib/format";
 import {
   loadTranscriptionPreferences,
@@ -96,15 +77,6 @@ const TRANSCRIPTION_ACTION_IDS = new Set<ActionId>([
   ACTION_IDS.AUD_TRANSCRIBE_VTT,
 ]);
 
-function createJobId(actionId: ActionId, filePath: string): string {
-  const suffix =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const name = filePath.split("/").pop() ?? "file";
-  return `${actionId}:${name}:${suffix}`;
-}
-
 function formatImportWarnings(summary: BatchImportSummary): string[] {
   const warnings: string[] = [];
 
@@ -130,87 +102,11 @@ function buildStatusLabel(result: BatchFileResult): string {
     case "skipped":
       return "已跳过";
     case "cancelled":
-      return "剩余项未执行";
+      return "已取消 / 未执行";
     case "running":
       return "处理中";
     default:
       return "待处理";
-  }
-}
-
-async function runAction(
-  file: FileInfo,
-  actionId: ActionId,
-  opts?: BatchActionOptions,
-  jobId?: string,
-) {
-  switch (actionId) {
-    case ACTION_IDS.IMG_JPG:
-    case ACTION_IDS.IMG_PNG:
-    case ACTION_IDS.IMG_WEBP:
-      return convertImage(
-        file.path,
-        imageOutputFormatFromActionId(actionId),
-        opts?.imageQuality,
-      );
-    case ACTION_IDS.MD_HTML:
-      return exportMarkdown(file.path);
-    case ACTION_IDS.PDF_TXT:
-      return extractPdfText(file.path, "txt");
-    case ACTION_IDS.PDF_MD:
-      return extractPdfText(file.path, "md");
-    case ACTION_IDS.VID_GIF:
-      return videoToGif(
-        file.path,
-        opts?.gifFps ?? 15,
-        opts?.gifWidth ?? 480,
-        opts?.gifStartTime,
-        opts?.gifDuration,
-        jobId,
-      );
-    case ACTION_IDS.VID_COMPRESS:
-      return compressVideo(
-        file.path,
-        opts?.compressQuality ?? "balanced",
-        opts?.compressMaxResolution,
-        jobId,
-      );
-    case ACTION_IDS.VID_MP3:
-    case ACTION_IDS.AUD_MP3:
-      return extractAudio(file.path, "mp3", jobId);
-    case ACTION_IDS.VID_WAV:
-    case ACTION_IDS.AUD_WAV:
-      return extractAudio(file.path, "wav", jobId);
-    case ACTION_IDS.VID_TRANSCRIBE:
-    case ACTION_IDS.AUD_TRANSCRIBE:
-      return transcribeAudio(
-        file.path,
-        opts?.transcriptionModel ?? "base",
-        opts?.transcriptionLanguage ?? "auto",
-        undefined,
-        jobId,
-        opts?.transcriptionMixedLanguageMode,
-      );
-    case ACTION_IDS.VID_TRANSCRIBE_SRT:
-    case ACTION_IDS.AUD_TRANSCRIBE_SRT:
-      return transcribeAudio(
-        file.path,
-        opts?.transcriptionModel ?? "base",
-        opts?.transcriptionLanguage ?? "auto",
-        "srt",
-        jobId,
-        opts?.transcriptionMixedLanguageMode,
-      );
-    case ACTION_IDS.VID_TRANSCRIBE_VTT:
-    case ACTION_IDS.AUD_TRANSCRIBE_VTT:
-      return transcribeAudio(
-        file.path,
-        opts?.transcriptionModel ?? "base",
-        opts?.transcriptionLanguage ?? "auto",
-        "vtt",
-        jobId,
-        opts?.transcriptionMixedLanguageMode,
-      );
   }
 }
 
@@ -230,19 +126,13 @@ export function BatchPanel({
   );
   const [preferMixedLanguageMode, setPreferMixedLanguageMode] =
     useState<boolean>(() => loadTranscriptionPreferences().preferMixedLanguageMode);
-  const stopAfterCurrentRef = useRef(false);
   const isMountedRef = useRef(true);
-  const resultsRef = useRef(state.results);
   const modelRefreshRequestIdRef = useRef(0);
   const previousFileIdentityRef = useRef<string | null>(null);
   const fileIdentity = useMemo(
     () => files.map((file) => file.path).join("\n"),
     [files],
   );
-
-  useEffect(() => {
-    resultsRef.current = state.results;
-  }, [state.results]);
 
   useEffect(() => {
     return () => {
@@ -257,7 +147,6 @@ export function BatchPanel({
 
     previousFileIdentityRef.current = fileIdentity;
     dispatch({ type: "resetForFiles", files });
-    stopAfterCurrentRef.current = false;
   }, [fileIdentity, files]);
 
   useEffect(() => {
@@ -272,43 +161,6 @@ export function BatchPanel({
     dispatch({ type: "modelRefreshCompleted", state: "idle" });
     modelRefreshRequestIdRef.current += 1;
   }, [preferredModel]);
-
-  useEffect(() => {
-    if (!state.progress.currentJobId) {
-      return;
-    }
-
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void listenConversionProgress((event: ConversionProgressEvent) => {
-      if (
-        disposed ||
-        !state.progress.currentJobId ||
-        event.jobId !== state.progress.currentJobId
-      ) {
-        return;
-      }
-
-      dispatch({ type: "progressReceived", event });
-    })
-      .then((fn) => {
-        if (disposed) {
-          fn();
-          return;
-        }
-
-        unlisten = fn;
-      })
-      .catch((error: unknown) => {
-        console.error("Failed to listen for batch conversion progress", error);
-      });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [state.progress.currentJobId]);
 
   const fileType = files[0]?.file_type ?? "unknown";
   const runtime = files[0]?.runtime;
@@ -366,157 +218,17 @@ export function BatchPanel({
     [buildTranscriptionOptions],
   );
 
-  const executeBatch = useCallback(
-    async (
-      context: BatchRunContext,
-      selectedIndices: number[],
-      mode: "all" | "partial",
-    ) => {
-      if (selectedIndices.length === 0) {
-        return;
-      }
-
-      dispatch({ type: "runStarted", context });
-      stopAfterCurrentRef.current = false;
-
-      const nextResults =
-        mode === "all"
-          ? buildInitialResults(files)
-          : resultsRef.current.map((result) => ({ ...result }));
-
-      if (mode === "partial") {
-        for (const index of selectedIndices) {
-          nextResults[index] = {
-            file: files[index],
-            status: "pending",
-          };
-        }
-      }
-
-      if (isMountedRef.current) {
-        dispatch({ type: "resultsReplaced", results: [...nextResults] });
-      }
-
-      let stopped = false;
-
-      for (const index of selectedIndices) {
-        if (stopAfterCurrentRef.current) {
-          stopped = true;
-          break;
-        }
-
-        const file = files[index];
-
-        if (shouldSkipBatchAction(file, context.actionId)) {
-          nextResults[index] = {
-            file,
-            status: "skipped",
-          };
-          if (isMountedRef.current) {
-            dispatch({ type: "resultsReplaced", results: [...nextResults] });
-          }
-          continue;
-        }
-
-        const jobId = actionUsesRealtimeProgress(context.actionId)
-          ? createJobId(context.actionId, file.path)
-          : undefined;
-
-        nextResults[index] = {
-          file,
-          status: "running",
-        };
-
-        if (isMountedRef.current) {
-          dispatch({ type: "resultsReplaced", results: [...nextResults] });
-          dispatch({ type: "fileStarted", index, jobId: jobId ?? null });
-        }
-
-        try {
-          const result = await runAction(file, context.actionId, context.options, jobId);
-          nextResults[index] = {
-            file,
-            status: "success",
-            result,
-          };
-        } catch (error) {
-          nextResults[index] = {
-            file,
-            status: "error",
-            error: getErrorMessage(error, "转换失败"),
-          };
-        }
-
-        if (!isMountedRef.current) {
-          return;
-        }
-
-        dispatch({ type: "fileFinished", results: [...nextResults] });
-      }
-
-      if (stopAfterCurrentRef.current) {
-        stopped = true;
-      }
-
-      if (stopped) {
-        for (const index of selectedIndices) {
-          if (nextResults[index].status === "pending") {
-            nextResults[index] = {
-              file: files[index],
-              status: "cancelled",
-            };
-          }
-        }
-      }
-
-      if (isMountedRef.current) {
-        dispatch({
-          type: "runCompleted",
-          results: [...nextResults],
-          stopped,
-        });
-      }
-    },
-    [files],
-  );
-
-  const startBatch = useCallback(
-    async (actionId: ActionId, options?: BatchActionOptions) => {
-      const selectedIndices = files.map((_, index) => index);
-      await executeBatch(
-        { actionId, options: mergeActionOptions(actionId, options) },
-        selectedIndices,
-        "all",
-      );
-    },
-    [executeBatch, files, mergeActionOptions],
-  );
-
-  const retryFailedItems = useCallback(async () => {
-    if (!state.lastRunContext) {
-      return;
-    }
-
-    const failedIndices = resultsRef.current
-      .map((result, index) => ({ result, index }))
-      .filter(({ result }) => result.status === "error")
-      .map(({ index }) => index);
-
-    await executeBatch(state.lastRunContext, failedIndices, "partial");
-  }, [executeBatch, state.lastRunContext]);
-
-  const continueRemainingItems = useCallback(async () => {
-    if (!state.lastRunContext) {
-      return;
-    }
-
-    const cancelledIndices = resultsRef.current
-      .map((result, index) => ({ result, index }))
-      .filter(({ result }) => result.status === "cancelled")
-      .map(({ index }) => index);
-
-    await executeBatch(state.lastRunContext, cancelledIndices, "partial");
-  }, [executeBatch, state.lastRunContext]);
+  const {
+    startBatch,
+    retryFailedItems,
+    continueRemainingItems,
+    requestStop,
+  } = useBatchRunner({
+    files,
+    state,
+    dispatch,
+    mergeActionOptions,
+  });
 
   const refreshBatchFilesForModel = useCallback(
     async (
@@ -715,11 +427,6 @@ export function BatchPanel({
     [startBatch, state.optionsPanel],
   );
 
-  const handleRequestStop = useCallback(() => {
-    stopAfterCurrentRef.current = true;
-    dispatch({ type: "stopRequested" });
-  }, []);
-
   if (state.phase === "selecting") {
     return (
       <BatchSelectionView
@@ -782,7 +489,7 @@ export function BatchPanel({
         progress={state.progress}
         stopRequested={state.stopRequested}
         buildStatusLabel={buildStatusLabel}
-        onRequestStop={handleRequestStop}
+        onRequestStop={requestStop}
       />
     );
   }

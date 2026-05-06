@@ -76,6 +76,13 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      - name: Install PDF test dependency
+        run: brew install poppler
+
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test
+
+      - name: Run Clippy
+        working-directory: src-tauri
+        run: cargo clippy -- -D warnings

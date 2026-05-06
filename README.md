@@ -53,7 +53,7 @@ npx tauri dev
 
 仓库现在带了两条 GitHub Actions 工作流：
 
-- `CI`：用于日常 `push / pull_request` 的轻量检查，只跑前端 `lint + build` 和 macOS 上的 `cargo test`，尽量省 action 分钟。
+- `CI`：用于日常 `push / pull_request` 的轻量检查，跑前端 `lint + build`、macOS 上的 `cargo test` 和 `cargo clippy -- -D warnings`，并安装 Poppler 覆盖 PDF fixture 测试。
 - `Manual macOS Bundle`：只在你手动触发时跑完整的 `npx tauri build --debug --bundles app`，并把 `Forph.app` 作为 artifact 上传，适合需要远程验证桌面打包时再用。
 - `Release`：只在你推送版本 tag 时触发，例如 `v0.1.0`。它会校验 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 的版本是否和 tag 一致，然后构建 release 版 `Forph.app`，自动创建 GitHub Release，并上传压缩产物。
 
@@ -100,7 +100,7 @@ brew install ffmpeg poppler whisper-cpp
 - 转换完成后，结果面板的文件卡片支持直接拖拽到 Finder、微信、邮件等其他应用。批量模式下可一次拖出所有结果文件。
 - 长任务会实时回传进度。压缩、GIF、提取音频会尽量显示百分比和时长；如果外部工具本身不提供稳定百分比，界面会自动退回阶段性进度而不是显示假数值。
 - 拖入多个文件或使用文件浏览器多选时，会自动进入批量处理模式。如果文件类型混合，会按最多的类型归组处理，同时提示被跳过的文件数量。
-- 批量处理中可以选择“处理完当前文件后停止”；点下后会立即进入“已请求停止”状态，当前文件完成后再收尾。完成页也支持“重试失败项”和“继续剩余项”。
+- 单文件长任务和批量长任务都支持取消。批量处理中选择“取消当前文件并停止剩余项”后，会向当前 ffmpeg / whisper 子进程发送取消请求，剩余项不会继续开始。完成页也支持“重试失败项”和“继续剩余项”。
 - 文件转换和转写都在本机完成，但首次安装依赖、下载模型这些恢复路径仍然需要联网。
 - 转写默认推荐 `small + 自动检测`；如果当前只装了 `base`，界面会先回退到 `base` 继续可用，同时提示你升级到 `small`。
 - Whisper 缺模型时，界面会跟随当前选中的模型给出“下载模型”“从下载目录导入”“重新检测模型”和“打开模型文件夹”的入口，不会再把 `small` 误写成 `base`。

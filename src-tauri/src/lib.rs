@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     env,
     ffi::OsString,
     io::{self, Read},
@@ -133,6 +133,117 @@ enum ValidatedOpenTarget {
 struct StreamCommandOutput {
     status: ExitStatus,
     stderr: String,
+    cancelled: bool,
+}
+
+#[derive(Clone, Default)]
+struct JobRegistry {
+    state: Arc<Mutex<JobRegistryState>>,
+}
+
+#[derive(Default)]
+struct JobRegistryState {
+    pids: HashMap<String, u32>,
+    cancelled: BTreeSet<String>,
+}
+
+struct JobRegistration {
+    registry: Option<JobRegistry>,
+    job_id: Option<String>,
+}
+
+impl JobRegistry {
+    fn register(&self, job_id: &str, pid: u32) -> Result<(), String> {
+        if job_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "任务注册表不可用。".to_string())?;
+        state.pids.insert(job_id.to_string(), pid);
+        state.cancelled.remove(job_id);
+        Ok(())
+    }
+
+    fn unregister(&self, job_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pids.remove(job_id);
+        }
+    }
+
+    fn cancel(&self, job_id: &str) -> Result<bool, String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Err("任务 ID 不能为空。".into());
+        }
+
+        let pid = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "任务注册表不可用。".to_string())?;
+            let Some(pid) = state.pids.get(job_id).copied() else {
+                return Ok(false);
+            };
+            state.cancelled.insert(job_id.to_string());
+            pid
+        };
+
+        let pid_arg = pid.to_string();
+        let output = command_with_augmented_path("kill")
+            .args(["-TERM", pid_arg.as_str()])
+            .output()
+            .map_err(|error| format!("无法发送取消请求: {}", error))?;
+
+        if output.status.success() {
+            return Ok(true);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("No such process") || stderr.contains("no such process") {
+            return Ok(false);
+        }
+
+        Err(if stderr.is_empty() {
+            "无法取消当前任务。".into()
+        } else {
+            format!("无法取消当前任务: {}", stderr)
+        })
+    }
+
+    fn take_cancelled(&self, job_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| state.cancelled.remove(job_id))
+            .unwrap_or(false)
+    }
+}
+
+impl JobRegistration {
+    fn new(registry: Option<JobRegistry>, job_id: Option<String>, pid: u32) -> Self {
+        if let (Some(registry), Some(job_id)) = (&registry, &job_id) {
+            let _ = registry.register(job_id, pid);
+        }
+
+        Self { registry, job_id }
+    }
+
+    fn was_cancelled(&self) -> bool {
+        match (&self.registry, &self.job_id) {
+            (Some(registry), Some(job_id)) => registry.take_cancelled(job_id),
+            _ => false,
+        }
+    }
+}
+
+impl Drop for JobRegistration {
+    fn drop(&mut self) {
+        if let (Some(registry), Some(job_id)) = (&self.registry, &self.job_id) {
+            registry.unregister(job_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +314,14 @@ impl ProgressReporter {
         };
 
         let _ = self.app.emit("forph://conversion-progress", event);
+    }
+
+    fn job_id(&self) -> Option<String> {
+        self.job_id.clone()
+    }
+
+    fn job_registry(&self) -> JobRegistry {
+        self.app.state::<JobRegistry>().inner().clone()
     }
 }
 
@@ -471,6 +590,31 @@ fn normalized_transcription_language(language: Option<String>) -> Result<String,
     }
 }
 
+fn normalized_transcription_model(model: String) -> Result<String, String> {
+    let normalized = model.trim().to_lowercase();
+    match normalized.as_str() {
+        "base" | "small" | "medium" => Ok(normalized),
+        _ => Err("不支持的转写模型。".into()),
+    }
+}
+
+fn normalized_transcription_output_format(output_format: Option<String>) -> Result<String, String> {
+    let normalized = output_format
+        .unwrap_or_else(|| "txt".into())
+        .trim()
+        .to_lowercase();
+    let normalized = if normalized.is_empty() {
+        "txt".to_string()
+    } else {
+        normalized
+    };
+
+    match normalized.as_str() {
+        "txt" | "srt" | "vtt" => Ok(normalized),
+        _ => Err("转写输出格式仅支持 TXT / SRT / VTT。".into()),
+    }
+}
+
 fn round_duration(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
@@ -545,8 +689,7 @@ fn validate_input_file_path(path: &str) -> Result<PathBuf, String> {
     let resolved = candidate
         .canonicalize()
         .map_err(|e| format!("无法解析文件路径: {}", e))?;
-    let metadata = std::fs::metadata(&resolved)
-        .map_err(|e| format!("无法读取文件: {}", e))?;
+    let metadata = std::fs::metadata(&resolved).map_err(|e| format!("无法读取文件: {}", e))?;
     if !metadata.is_file() {
         return Err("只能处理本地文件。".into());
     }
@@ -818,10 +961,7 @@ fn normalize_pdf_raw_text(raw: &str) -> String {
     raw.replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()
-        .filter(|ch| {
-            matches!(*ch, '\n' | '\u{000C}' | '\t')
-                || !ch.is_control()
-        })
+        .filter(|ch| matches!(*ch, '\n' | '\u{000C}' | '\t') || !ch.is_control())
         .collect()
 }
 
@@ -832,30 +972,22 @@ fn normalize_pdf_line_whitespace(line: &str) -> String {
 fn is_pdf_list_item(line: &str) -> bool {
     let trimmed = line.trim_start();
 
-    if trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("• ")
-    {
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
         return true;
     }
 
-    let digit_count = trimmed
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .count();
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
 
     if digit_count == 0 {
         return false;
     }
 
-    matches!(
-        trimmed.chars().nth(digit_count),
-        Some('.') | Some(')')
-    ) && trimmed
-        .chars()
-        .nth(digit_count + 1)
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false)
+    matches!(trimmed.chars().nth(digit_count), Some('.') | Some(')'))
+        && trimmed
+            .chars()
+            .nth(digit_count + 1)
+            .map(|ch| ch.is_whitespace())
+            .unwrap_or(false)
 }
 
 fn flush_pdf_paragraph_block(lines: &[String]) -> Option<String> {
@@ -939,6 +1071,38 @@ fn build_pdf_markdown_document(title: &str, pages: &[(usize, String)]) -> String
     output.trim_end().to_string() + "\n"
 }
 
+fn extract_pdf_pages_with_pdftotext(
+    pdftotext: PathBuf,
+    input_path: &Path,
+) -> Result<Vec<(usize, String)>, String> {
+    let extraction_output = command_with_augmented_path(pdftotext)
+        .args(["-enc", "UTF-8", "-eol", "unix", "-q"])
+        .arg(input_path)
+        .arg("-")
+        .output()
+        .map_err(|error| format!("调用 pdftotext 失败: {}", error))?;
+
+    if !extraction_output.status.success() {
+        let stderr = String::from_utf8_lossy(&extraction_output.stderr)
+            .trim()
+            .to_string();
+        let details = if stderr.is_empty() {
+            "文件可能已加密、损坏，或当前系统无法读取它的文本层。".into()
+        } else {
+            stderr
+        };
+        return Err(format!("PDF 文本提取失败：{}", details));
+    }
+
+    let raw_text = String::from_utf8_lossy(&extraction_output.stdout).to_string();
+    let pages = extract_clean_pdf_pages(&raw_text);
+    if pages.is_empty() {
+        return Err("该 PDF 没有可提取文本层，可能是扫描件；v1 暂不支持 OCR。".into());
+    }
+
+    Ok(pages)
+}
+
 fn clamp_gif_window(
     start_time: Option<f64>,
     duration: Option<f64>,
@@ -965,8 +1129,7 @@ fn save_image_with_quality(
 ) -> Result<(), String> {
     match format {
         "jpg" | "jpeg" => {
-            let file =
-                std::fs::File::create(path).map_err(|e| format!("创建文件失败: {}", e))?;
+            let file = std::fs::File::create(path).map_err(|e| format!("创建文件失败: {}", e))?;
             let mut writer = std::io::BufWriter::new(file);
             let q = quality.unwrap_or(85);
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, q);
@@ -1086,7 +1249,9 @@ fn validate_open_target_request(
         return Ok(ValidatedOpenTarget::Path(normalized));
     }
 
-    Ok(ValidatedOpenTarget::Path(validate_existing_local_target(trimmed)?))
+    Ok(ValidatedOpenTarget::Path(validate_existing_local_target(
+        trimmed,
+    )?))
 }
 
 fn dependency_is_installed(package_name: &str) -> bool {
@@ -1141,11 +1306,11 @@ fn compression_scale_filter(max_long_edge: u32) -> String {
 fn parse_ffmpeg_progress_line(line: &str) -> Option<FfmpegProgressUpdate> {
     let (key, value) = line.split_once('=')?;
     match key.trim() {
-        "out_time_us" | "out_time_ms" => value
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|microseconds| FfmpegProgressUpdate::OutTimeSeconds(microseconds / 1_000_000.0)),
+        "out_time_us" | "out_time_ms" => {
+            value.trim().parse::<f64>().ok().map(|microseconds| {
+                FfmpegProgressUpdate::OutTimeSeconds(microseconds / 1_000_000.0)
+            })
+        }
         "progress" if value.trim() == "end" => Some(FfmpegProgressUpdate::End),
         _ => None,
     }
@@ -1154,10 +1319,7 @@ fn parse_ffmpeg_progress_line(line: &str) -> Option<FfmpegProgressUpdate> {
 fn parse_whisper_progress_percent(line: &str) -> Option<f64> {
     line.split_whitespace().find_map(|token| {
         let cleaned = token.trim_matches(|char: char| {
-            matches!(
-                char,
-                '[' | ']' | '(' | ')' | ',' | ':' | ';' | '"' | '\''
-            )
+            matches!(char, '[' | ']' | '(' | ')' | ',' | ':' | ';' | '"' | '\'')
         });
 
         cleaned
@@ -1167,10 +1329,7 @@ fn parse_whisper_progress_percent(line: &str) -> Option<f64> {
     })
 }
 
-fn consume_stream_lines<R: Read>(
-    mut reader: R,
-    mut on_line: impl FnMut(&str),
-) -> io::Result<()> {
+fn consume_stream_lines<R: Read>(mut reader: R, mut on_line: impl FnMut(&str)) -> io::Result<()> {
     let mut buffer = [0_u8; 4096];
     let mut pending = Vec::new();
 
@@ -1209,10 +1368,15 @@ fn run_command_streaming(
     mut command: StdCommand,
     mut on_stdout_line: impl FnMut(&str),
     mut on_stderr_line: impl FnMut(&str) + Send + 'static,
+    registry: Option<JobRegistry>,
+    job_id: Option<String>,
 ) -> Result<StreamCommandOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|e| format!("命令启动失败: {}", e))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("命令启动失败: {}", e))?;
+    let registration = JobRegistration::new(registry, job_id, child.id());
     let stdout = child
         .stdout
         .take()
@@ -1241,12 +1405,25 @@ fn run_command_streaming(
     let stderr = stderr_handle
         .join()
         .map_err(|_| "读取命令错误输出失败: 线程中断".to_string())??;
+    let cancelled = registration.was_cancelled();
+
+    if cancelled {
+        return Ok(StreamCommandOutput {
+            status,
+            stderr,
+            cancelled,
+        });
+    }
 
     if let Err(error) = stdout_result {
         return Err(format!("读取命令输出失败: {}", error));
     }
 
-    Ok(StreamCommandOutput { status, stderr })
+    Ok(StreamCommandOutput {
+        status,
+        stderr,
+        cancelled,
+    })
 }
 
 fn run_ffmpeg_with_progress(
@@ -1281,46 +1458,55 @@ fn run_ffmpeg_with_progress(
     );
 
     let mut last_percent: Option<f64> = None;
-    let output = run_command_streaming(command, |line| match parse_ffmpeg_progress_line(line) {
-        Some(FfmpegProgressUpdate::OutTimeSeconds(current_seconds)) => {
-            let Some(total_seconds) = total_duration else {
-                return;
-            };
+    let output = run_command_streaming(
+        command,
+        |line| match parse_ffmpeg_progress_line(line) {
+            Some(FfmpegProgressUpdate::OutTimeSeconds(current_seconds)) => {
+                let Some(total_seconds) = total_duration else {
+                    return;
+                };
 
-            let fraction = (current_seconds / total_seconds).clamp(0.0, 1.0);
-            let percent =
-                progress_range.0 + ((progress_range.1 - progress_range.0) * fraction);
+                let fraction = (current_seconds / total_seconds).clamp(0.0, 1.0);
+                let percent = progress_range.0 + ((progress_range.1 - progress_range.0) * fraction);
 
-            let should_emit = last_percent
-                .map(|previous| (previous - percent).abs() >= 0.5)
-                .unwrap_or(true);
-            if should_emit {
-                reporter.emit(
-                    stage,
-                    Some(percent),
-                    false,
-                    Some(message),
-                    Some(current_seconds.min(total_seconds)),
-                    Some(total_seconds),
-                );
-                last_percent = Some(percent);
+                let should_emit = last_percent
+                    .map(|previous| (previous - percent).abs() >= 0.5)
+                    .unwrap_or(true);
+                if should_emit {
+                    reporter.emit(
+                        stage,
+                        Some(percent),
+                        false,
+                        Some(message),
+                        Some(current_seconds.min(total_seconds)),
+                        Some(total_seconds),
+                    );
+                    last_percent = Some(percent);
+                }
             }
-        }
-        Some(FfmpegProgressUpdate::End) => {
-            if total_duration.is_some() {
-                reporter.emit(
-                    stage,
-                    Some(progress_range.1),
-                    false,
-                    Some(message),
-                    total_duration,
-                    total_duration,
-                );
-                last_percent = Some(progress_range.1);
+            Some(FfmpegProgressUpdate::End) => {
+                if total_duration.is_some() {
+                    reporter.emit(
+                        stage,
+                        Some(progress_range.1),
+                        false,
+                        Some(message),
+                        total_duration,
+                        total_duration,
+                    );
+                    last_percent = Some(progress_range.1);
+                }
             }
-        }
-        None => {}
-    }, |_| {})?;
+            None => {}
+        },
+        |_| {},
+        Some(reporter.job_registry()),
+        reporter.job_id(),
+    )?;
+
+    if output.cancelled {
+        return Err("任务已取消".into());
+    }
 
     if !output.status.success() {
         let details = output.stderr.trim();
@@ -1414,7 +1600,13 @@ fn run_whisper_with_progress(
                 &last_percent_for_stderr,
             );
         },
+        Some(reporter.job_registry()),
+        reporter.job_id(),
     )?;
+
+    if output.cancelled {
+        return Err("任务已取消".into());
+    }
 
     if !output.status.success() {
         let details = output.stderr.trim();
@@ -1548,7 +1740,10 @@ fn format_vtt_timestamp(milliseconds: u64) -> String {
 fn parse_timestamp_range(line: &str) -> Option<(u64, u64)> {
     let (start, end) = line.split_once("-->")?;
     let end_token = end.split_whitespace().next()?;
-    Some((parse_timestamp_ms(start.trim())?, parse_timestamp_ms(end_token)?))
+    Some((
+        parse_timestamp_ms(start.trim())?,
+        parse_timestamp_ms(end_token)?,
+    ))
 }
 
 fn parse_srt_cues(content: &str) -> Vec<SubtitleCue> {
@@ -1592,11 +1787,7 @@ fn parse_vtt_cues(content: &str) -> Vec<SubtitleCue> {
     let normalized = normalize_text_lines(content);
     let normalized = normalized.trim_start_matches('\u{feff}');
     let body = if normalized.trim_start().starts_with("WEBVTT") {
-        normalized
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n")
+        normalized.lines().skip(1).collect::<Vec<_>>().join("\n")
     } else {
         normalized.to_string()
     };
@@ -1877,9 +2068,10 @@ fn build_speech_segments_from_silence_events(
     for event in events {
         match *event {
             SilenceEvent::Start(silence_start_ms) => {
-                if let Some(segment) =
-                    speech_segment(next_speech_start_ms, silence_start_ms.min(total_duration_ms))
-                {
+                if let Some(segment) = speech_segment(
+                    next_speech_start_ms,
+                    silence_start_ms.min(total_duration_ms),
+                ) {
                     segments.push(segment);
                 }
                 next_speech_start_ms = silence_start_ms.min(total_duration_ms);
@@ -1971,7 +2163,11 @@ fn merge_short_segments(
 
         while current.duration_ms < min_segment_ms && index + 1 < segments.len() {
             let next = &segments[index + 1];
-            if next.absolute_end_ms.saturating_sub(current.absolute_start_ms) > max_segment_ms {
+            if next
+                .absolute_end_ms
+                .saturating_sub(current.absolute_start_ms)
+                > max_segment_ms
+            {
                 break;
             }
 
@@ -1988,7 +2184,9 @@ fn merge_short_segments(
     for segment in forward_merged {
         if let Some(last) = collapsed.last_mut() {
             if segment.duration_ms < min_segment_ms
-                && segment.absolute_end_ms.saturating_sub(last.absolute_start_ms)
+                && segment
+                    .absolute_end_ms
+                    .saturating_sub(last.absolute_start_ms)
                     <= max_segment_ms
             {
                 last.absolute_end_ms = segment.absolute_end_ms;
@@ -2007,10 +2205,15 @@ fn normalize_speech_segments(
     raw_segments: Vec<SpeechSegment>,
     total_duration_ms: u64,
 ) -> Vec<SpeechSegment> {
-    let padded = apply_padding_to_segments(raw_segments, total_duration_ms, MIXED_LANGUAGE_PADDING_MS);
+    let padded =
+        apply_padding_to_segments(raw_segments, total_duration_ms, MIXED_LANGUAGE_PADDING_MS);
     let merged = merge_overlapping_segments(padded);
     let split = split_long_segments(merged, MIXED_LANGUAGE_MAX_SEGMENT_MS);
-    merge_short_segments(split, MIXED_LANGUAGE_MIN_SEGMENT_MS, MIXED_LANGUAGE_MAX_SEGMENT_MS)
+    merge_short_segments(
+        split,
+        MIXED_LANGUAGE_MIN_SEGMENT_MS,
+        MIXED_LANGUAGE_MAX_SEGMENT_MS,
+    )
 }
 
 fn detect_speech_segments(
@@ -2163,7 +2366,11 @@ fn run_mixed_language_transcription(
                 "detect",
                 Some(segment_progress_start),
                 true,
-                Some(&format!("正在检测第 {}/{} 段语言...", index + 1, total_segments)),
+                Some(&format!(
+                    "正在检测第 {}/{} 段语言...",
+                    index + 1,
+                    total_segments
+                )),
                 Some(millis_to_seconds(segment.absolute_start_ms)),
                 Some(total_duration_seconds),
             );
@@ -2218,8 +2425,14 @@ fn run_mixed_language_transcription(
                 "transcribe",
                 Some(segment_progress_end),
                 false,
-                Some(&format!("已完成第 {}/{} 段转写。", index + 1, total_segments)),
-                Some(millis_to_seconds(segment.absolute_end_ms.min(total_duration_ms))),
+                Some(&format!(
+                    "已完成第 {}/{} 段转写。",
+                    index + 1,
+                    total_segments
+                )),
+                Some(millis_to_seconds(
+                    segment.absolute_end_ms.min(total_duration_ms),
+                )),
                 Some(total_duration_seconds),
             );
 
@@ -2235,8 +2448,7 @@ fn run_mixed_language_transcription(
             Some(total_duration_seconds),
         );
 
-        let merged_output =
-            merge_transcription_chunk_outputs(&outputs, format, total_duration_ms)?;
+        let merged_output = merge_transcription_chunk_outputs(&outputs, format, total_duration_ms)?;
         std::fs::write(output_path, merged_output)
             .map_err(|error| format!("写入合并后的转写结果失败: {}", error))?;
         Ok(())
@@ -2426,41 +2638,18 @@ async fn extract_pdf_text(
     let Some(pdftotext) = pdftotext_command_path() else {
         return Err("需要安装 Poppler (pdftotext)".into());
     };
-    let input_path_for_extract = input_path.clone();
+    let input_path_for_extract = PathBuf::from(input_path);
 
     let title = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Document");
 
-    let extraction_output = tauri::async_runtime::spawn_blocking(move || {
-        command_with_augmented_path(pdftotext)
-            .args(["-enc", "UTF-8", "-eol", "unix", "-q"])
-            .arg(&input_path_for_extract)
-            .arg("-")
-            .output()
+    let pages = tauri::async_runtime::spawn_blocking(move || {
+        extract_pdf_pages_with_pdftotext(pdftotext, &input_path_for_extract)
     })
     .await
-    .map_err(|error| format!("PDF 提取任务执行失败: {}", error))?
-    .map_err(|error| format!("调用 pdftotext 失败: {}", error))?;
-
-    if !extraction_output.status.success() {
-        let stderr = String::from_utf8_lossy(&extraction_output.stderr)
-            .trim()
-            .to_string();
-        let details = if stderr.is_empty() {
-            "文件可能已加密、损坏，或当前系统无法读取它的文本层。".into()
-        } else {
-            stderr
-        };
-        return Err(format!("PDF 文本提取失败：{}", details));
-    }
-
-    let raw_text = String::from_utf8_lossy(&extraction_output.stdout).to_string();
-    let pages = extract_clean_pdf_pages(&raw_text);
-    if pages.is_empty() {
-        return Err("该 PDF 没有可提取文本层，可能是扫描件；v1 暂不支持 OCR。".into());
-    }
+    .map_err(|error| format!("PDF 提取任务执行失败: {}", error))??;
 
     let output_text = match extension {
         "txt" => pages
@@ -2677,10 +2866,7 @@ async fn compress_video(
 
     if let Some(ref res) = max_resolution {
         if let Some(max_long_edge) = max_long_edge_for_resolution(res) {
-            args.extend([
-                "-vf".into(),
-                compression_scale_filter(max_long_edge),
-            ]);
+            args.extend(["-vf".into(), compression_scale_filter(max_long_edge)]);
         }
     }
 
@@ -2739,6 +2925,7 @@ async fn transcribe_audio(
     let Some(whisper_cmd) = whisper_cpp_command_path() else {
         return Err("需要安装 whisper-cpp".into());
     };
+    let model_size = normalized_transcription_model(model_size)?;
     let language = normalized_transcription_language(language)?;
 
     let Some(ffmpeg) = ffmpeg_command_path() else {
@@ -2759,11 +2946,12 @@ async fn transcribe_audio(
     let tmp_wav = unique_temp_file_path("forph-whisper", "wav");
     let tmp_wav_str = tmp_wav.to_string_lossy().to_string();
 
-    let fmt = output_format.unwrap_or_else(|| "txt".to_string());
+    let fmt = normalized_transcription_output_format(output_format)?;
     let (whisper_output_flag, file_ext) = match fmt.as_str() {
         "srt" => ("-osrt", "srt"),
         "vtt" => ("-ovtt", "vtt"),
-        _ => ("-otxt", "txt"),
+        "txt" => ("-otxt", "txt"),
+        _ => unreachable!("transcription output format is validated above"),
     };
 
     let out = make_output_path_for_input(&input, file_ext)?;
@@ -2772,8 +2960,9 @@ async fn transcribe_audio(
         .strip_suffix(&format!(".{}", file_ext))
         .unwrap_or(&out_str)
         .to_string();
-    let use_mixed_language_mode =
-        mixed_language_mode.unwrap_or(false) && language == "auto" && total_duration.unwrap_or(0.0) > 0.0;
+    let use_mixed_language_mode = mixed_language_mode.unwrap_or(false)
+        && language == "auto"
+        && total_duration.unwrap_or(0.0) > 0.0;
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path.clone());
@@ -2937,15 +3126,14 @@ fn import_downloaded_model(
     }
 
     let downloads = downloads_dir();
-    let source_path = find_downloaded_model_candidate_in_dir(&downloads, &model_name).ok_or_else(
-        || {
+    let source_path =
+        find_downloaded_model_candidate_in_dir(&downloads, &model_name).ok_or_else(|| {
             format!(
                 "没有在下载目录里找到 ggml-{}.bin。请先下载模型，或确认它仍在 {}。",
                 model_name,
                 downloads.to_string_lossy()
             )
-        },
-    )?;
+        })?;
 
     let target_dir = preferred_model_directory(&app);
     std::fs::create_dir_all(&target_dir).map_err(|error| format!("无法创建模型目录: {}", error))?;
@@ -3010,11 +3198,22 @@ fn open_target(
     Ok(())
 }
 
+#[tauri::command]
+fn cancel_job(app: AppHandle, job_id: String) -> Result<(), String> {
+    let registry = app.state::<JobRegistry>();
+    if registry.cancel(&job_id)? {
+        Ok(())
+    } else {
+        Err("当前任务已经结束或不存在。".into())
+    }
+}
+
 // ─── App Setup ───────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(JobRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
         .invoke_handler(tauri::generate_handler![
@@ -3031,6 +3230,7 @@ pub fn run() {
             get_drag_icon,
             reveal_in_finder,
             open_target,
+            cancel_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Forph");
@@ -3040,18 +3240,20 @@ pub fn run() {
 mod tests {
     use super::{
         build_markdown_document, build_pdf_markdown_document, clamp_gif_window,
-        clean_pdf_page_text, compression_scale_filter, escape_html_text,
-        extract_clean_pdf_pages, find_downloaded_model_candidate_in_dir,
-        is_pdf_list_item, max_long_edge_for_resolution, merge_srt_outputs, merge_vtt_outputs,
-        normalize_detected_language_label, normalize_pdf_raw_text, normalize_speech_segments,
-        normalized_transcription_language, parse_detected_language, parse_ffmpeg_progress_line,
-        parse_silencedetect_event_line, parse_whisper_progress_percent, speech_segment,
-        strip_frontmatter, validate_existing_local_target, validate_input_file_path,
-        validate_open_target_request, make_output_path_for_input, FfmpegProgressUpdate,
-        SilenceEvent, ValidatedOpenTarget,
+        clean_pdf_page_text, compression_scale_filter, escape_html_text, extract_clean_pdf_pages,
+        extract_pdf_pages_with_pdftotext, find_downloaded_model_candidate_in_dir, is_pdf_list_item,
+        make_output_path_for_input, max_long_edge_for_resolution, merge_srt_outputs,
+        merge_vtt_outputs, normalize_detected_language_label, normalize_pdf_raw_text,
+        normalize_speech_segments, normalized_transcription_language,
+        normalized_transcription_model, normalized_transcription_output_format,
+        parse_detected_language, parse_ffmpeg_progress_line, parse_silencedetect_event_line,
+        parse_whisper_progress_percent, pdftotext_command_path, speech_segment, strip_frontmatter,
+        validate_existing_local_target, validate_input_file_path, validate_open_target_request,
+        FfmpegProgressUpdate, SilenceEvent, ValidatedOpenTarget,
     };
     use std::{
         fs,
+        io::Write,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3062,6 +3264,73 @@ mod tests {
             .expect("system clock before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("forph-{label}-{}-{unique}", std::process::id()))
+    }
+
+    fn write_minimal_pdf(path: &Path, page_stream: &str, include_font: bool) {
+        fn push_object(bytes: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+            offsets.push(bytes.len());
+            write!(bytes, "{id} 0 obj\n{body}\nendobj\n").expect("write pdf object");
+        }
+
+        let resources = if include_font {
+            "<< /Font << /F1 4 0 R >> >>"
+        } else {
+            "<< >>"
+        };
+        let contents = format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            page_stream.len(),
+            page_stream
+        );
+
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        push_object(
+            &mut bytes,
+            &mut offsets,
+            1,
+            "<< /Type /Catalog /Pages 2 0 R >>",
+        );
+        push_object(
+            &mut bytes,
+            &mut offsets,
+            2,
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        );
+        push_object(
+            &mut bytes,
+            &mut offsets,
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources {resources} /Contents 5 0 R >>"
+            ),
+        );
+        push_object(
+            &mut bytes,
+            &mut offsets,
+            4,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        );
+        push_object(&mut bytes, &mut offsets, 5, &contents);
+
+        let xref_start = bytes.len();
+        write!(
+            bytes,
+            "xref\n0 {}\n0000000000 65535 f \n",
+            offsets.len() + 1
+        )
+        .expect("write xref header");
+        for offset in offsets {
+            write!(bytes, "{offset:010} 00000 n \n").expect("write xref entry");
+        }
+        write!(
+            bytes,
+            "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        )
+        .expect("write trailer");
+
+        fs::write(path, bytes).expect("write pdf fixture");
     }
 
     #[test]
@@ -3182,6 +3451,43 @@ mod tests {
     }
 
     #[test]
+    fn extracts_text_from_real_pdf_fixture() {
+        let Some(pdftotext) = pdftotext_command_path() else {
+            eprintln!("skipping real PDF fixture test because pdftotext is not installed");
+            return;
+        };
+
+        let temp_dir = temp_test_path("pdf-text-fixture");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let pdf = temp_dir.join("text.pdf");
+        write_minimal_pdf(&pdf, "BT /F1 18 Tf 72 720 Td (Hello Forph PDF) Tj ET", true);
+
+        let pages = extract_pdf_pages_with_pdftotext(pdftotext, &pdf).expect("extract pdf text");
+        assert_eq!(pages, vec![(1, "Hello Forph PDF".into())]);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn reports_no_text_layer_for_real_pdf_without_text() {
+        let Some(pdftotext) = pdftotext_command_path() else {
+            eprintln!("skipping real PDF fixture test because pdftotext is not installed");
+            return;
+        };
+
+        let temp_dir = temp_test_path("pdf-image-fixture");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let pdf = temp_dir.join("no-text.pdf");
+        write_minimal_pdf(&pdf, "0.8 g 72 600 200 120 re f", false);
+
+        let error =
+            extract_pdf_pages_with_pdftotext(pdftotext, &pdf).expect_err("expected no text layer");
+        assert!(error.contains("没有可提取文本层"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn clamps_gif_window_into_video_bounds() {
         let (start, duration) = clamp_gif_window(Some(10.0), Some(8.0), Some(12.0));
         assert_eq!(start, 10.0);
@@ -3236,7 +3542,10 @@ mod tests {
     #[test]
     fn parses_whisper_progress_from_wrapped_tokens() {
         assert_eq!(parse_whisper_progress_percent("[42%]"), Some(42.0));
-        assert_eq!(parse_whisper_progress_percent("progress: 87.5%"), Some(87.5));
+        assert_eq!(
+            parse_whisper_progress_percent("progress: 87.5%"),
+            Some(87.5)
+        );
         assert_eq!(parse_whisper_progress_percent("no-progress-here"), None);
     }
 
@@ -3305,12 +3614,9 @@ mod tests {
         let allowed = temp_root.join("models");
         let other = temp_root.join("somewhere-else");
 
-        let allowed_result = validate_open_target_request(
-            allowed.to_string_lossy().as_ref(),
-            true,
-            &allowed,
-        )
-        .expect("expected model directory to be allowed");
+        let allowed_result =
+            validate_open_target_request(allowed.to_string_lossy().as_ref(), true, &allowed)
+                .expect("expected model directory to be allowed");
         assert_eq!(allowed_result, ValidatedOpenTarget::Path(allowed.clone()));
 
         let error = validate_open_target_request(other.to_string_lossy().as_ref(), true, &allowed)
@@ -3381,6 +3687,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_supported_transcription_models() {
+        assert_eq!(
+            normalized_transcription_model("SMALL".into()).expect("small should normalize"),
+            "small"
+        );
+        assert!(normalized_transcription_model("large".into()).is_err());
+    }
+
+    #[test]
+    fn validates_transcription_output_formats() {
+        assert_eq!(
+            normalized_transcription_output_format(None).expect("default output"),
+            "txt"
+        );
+        assert_eq!(
+            normalized_transcription_output_format(Some("VTT".into())).expect("vtt output"),
+            "vtt"
+        );
+        assert!(normalized_transcription_output_format(Some("docx".into())).is_err());
+    }
+
+    #[test]
     fn parses_silencedetect_log_lines() {
         assert_eq!(
             parse_silencedetect_event_line("[silencedetect @ 0x0] silence_start: 1.234"),
@@ -3424,7 +3752,10 @@ mod tests {
             parse_detected_language("auto-detected language: Chinese"),
             Some("zh".into())
         );
-        assert_eq!(normalize_detected_language_label("Deutsch"), Some("de".into()));
+        assert_eq!(
+            normalize_detected_language_label("Deutsch"),
+            Some("de".into())
+        );
         assert_eq!(normalize_detected_language_label("unknown"), None);
     }
 
@@ -3441,22 +3772,13 @@ mod tests {
             "1\n00:00:00,000 --> 00:00:02,000\nHallo\n\n2\n00:00:02,000 --> 00:00:03,000\nWelt\n",
         )
         .expect("write first srt chunk");
-        fs::write(
-            &second,
-            "1\n00:00:00,500 --> 00:00:01,500\n你好\n",
-        )
-        .expect("write second srt chunk");
+        fs::write(&second, "1\n00:00:00,500 --> 00:00:01,500\n你好\n")
+            .expect("write second srt chunk");
 
         let merged = merge_srt_outputs(
             &[
-                (
-                    speech_segment(0, 3_000).expect("segment 1"),
-                    first,
-                ),
-                (
-                    speech_segment(20_000, 23_000).expect("segment 2"),
-                    second,
-                ),
+                (speech_segment(0, 3_000).expect("segment 1"), first),
+                (speech_segment(20_000, 23_000).expect("segment 2"), second),
             ],
             30_000,
         )
@@ -3476,27 +3798,15 @@ mod tests {
         let first = temp_dir.join("chunk-000.vtt");
         let second = temp_dir.join("chunk-001.vtt");
 
-        fs::write(
-            &first,
-            "WEBVTT\n\n00:00.000 --> 00:02.000\nHallo\n",
-        )
-        .expect("write first vtt chunk");
-        fs::write(
-            &second,
-            "WEBVTT\n\n00:00.750 --> 00:02.250\n你好\n",
-        )
-        .expect("write second vtt chunk");
+        fs::write(&first, "WEBVTT\n\n00:00.000 --> 00:02.000\nHallo\n")
+            .expect("write first vtt chunk");
+        fs::write(&second, "WEBVTT\n\n00:00.750 --> 00:02.250\n你好\n")
+            .expect("write second vtt chunk");
 
         let merged = merge_vtt_outputs(
             &[
-                (
-                    speech_segment(0, 3_000).expect("segment 1"),
-                    first,
-                ),
-                (
-                    speech_segment(20_000, 23_000).expect("segment 2"),
-                    second,
-                ),
+                (speech_segment(0, 3_000).expect("segment 1"), first),
+                (speech_segment(20_000, 23_000).expect("segment 2"), second),
             ],
             30_000,
         )
@@ -3514,11 +3824,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).expect("create temp dir");
 
         let late = temp_dir.join("chunk-late.srt");
-        fs::write(
-            &late,
-            "1\n00:00:00,250 --> 00:00:01,250\nSpat\n",
-        )
-        .expect("write late srt chunk");
+        fs::write(&late, "1\n00:00:00,250 --> 00:00:01,250\nSpat\n").expect("write late srt chunk");
 
         let merged = merge_srt_outputs(
             &[(

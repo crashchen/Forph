@@ -14,11 +14,11 @@ The product is intentionally narrow: image conversion (JPG/PNG/WebP, HEIC via `s
 src/                          React + TS frontend
   App.tsx                     Top-level state machine: idle | actions | converting | done | batch | error
   components/
-    BatchPanel.tsx            (large, ~800 lines) batch orchestration; uses useReducer + batchState
+    BatchPanel.tsx            batch container; preferences, dependency recovery, and view wiring
     FileActions.tsx           (large, ~630 lines) single-file action surface
     DependencySection.tsx     ffmpeg / poppler / whisper-cpp install & model UX
     DropZone, Converting, ResultPanel, *Options
-    batch/                    BatchSelectionView, BatchProgressView, BatchResultView, batchState (reducer)
+    batch/                    BatchSelectionView, BatchProgressView, BatchResultView, batchState, useBatchRunner
   lib/
     actionIds.ts              Single source of truth for action IDs (ACTION_IDS as const)
     actions.ts                Per-action eligibility / batch behaviour
@@ -33,7 +33,7 @@ src-tauri/
   tauri.conf.json             macOSPrivateApi: true, transparent window with sidebar effect
 
 .github/workflows/
-  ci.yml                      lint + build (Ubuntu) + cargo test (macOS), on push/PR to main
+  ci.yml                      lint + build (Ubuntu) + cargo test + clippy (macOS), on push/PR to main
   macos-bundle.yml            workflow_dispatch only — builds debug .app artifact
   release.yml                 on tag v* — version-cross-check, builds release .app, zips, attaches to GH Release
 ```
@@ -43,6 +43,7 @@ src-tauri/
 - All backend calls go through `src/lib/commands.ts`. Don't call `invoke()` directly from components.
 - Action IDs are the contract between Rust (`build_actions` in `lib.rs`) and TS (`ACTION_IDS` in `actionIds.ts`). When you add an action, update **both** sides; `getFileInfo()` validates incoming IDs via `isActionId()` and throws on mismatch.
 - Long-running operations emit progress on the `forph://conversion-progress` Tauri event. Each call passes a `jobId` so the listener can filter to its own job. See `REALTIME_ACTION_IDS` for which actions emit progress.
+- Long-running ffmpeg / whisper jobs are registered in `JobRegistry` by `jobId`. Use `cancel_job(jobId)` for UI cancellation instead of inventing a second cancellation path.
 - All Rust commands return `Result<T, String>` — error messages are user-facing Chinese strings; the frontend forwards them via `getErrorMessage()` without translation.
 
 ## External tool discovery
@@ -68,6 +69,7 @@ Per `CONTRIBUTING.md`, run all three before every PR:
 npm run build      # tsc -b && vite build
 npm run lint       # eslint .
 cd src-tauri && cargo test
+cd src-tauri && cargo clippy -- -D warnings
 ```
 
 `cargo test` is the meaningful safety net — there's no frontend test suite. Don't skip it. The Rust tests cover the parsing helpers (ffmpeg progress, whisper progress, subtitle merge, language detection, path validation). When adding logic to those areas, add a unit test in the bottom `mod tests` block of `lib.rs`.
@@ -87,7 +89,6 @@ Because the app uses `macOSPrivateApi`, **Mac App Store distribution is not a go
 
 - **`lib.rs` is monolithic (~3400 lines).** Splitting into modules (`commands/`, `ffmpeg`, `whisper`, `pdf`, `paths`, `validation`, `progress`) is a known refactor target — keep new code organized so the eventual split is mechanical, not semantic.
 - **New file commands should validate at the boundary.** Existing conversion commands canonicalize through `validate_input_file_path`, and output files should be created through `make_output_path_for_input`. Keep that pattern when adding commands that accept paths from the frontend.
-- **No cancellation of in-flight ffmpeg/whisper child processes.** "Stop after current" in batch mode is enforced at the orchestration loop level (`stopAfterCurrentRef`); the running child runs to completion.
 - **`lucide-react@^1.7.0` is unusual.** Modern lucide-react versions are 0.x. Confirm the pinned major matches what's actually on npm before upgrading; the icon set in this version is small.
 - **Progress listener pattern** in `BatchPanel` and `Converting` uses `let disposed = false; ...then(fn => disposed ? fn() : unlisten = fn)`. This is the deliberate idiom — don't "fix" it without confirming a real leak.
 

@@ -103,7 +103,7 @@ export function createInitialBatchState(files: FileInfo[]): BatchPanelState {
   };
 }
 
-type BatchPanelAction =
+export type BatchPanelAction =
   | { type: "resetForFiles"; files: FileInfo[] }
   | { type: "toggleGifOptions" }
   | { type: "toggleCompressOptions" }
@@ -214,7 +214,7 @@ export function batchPanelReducer(
         progress: {
           ...defaultProgressState(),
           currentMessage: action.stopped
-            ? "已按你的要求在当前文件后停止，剩余项未执行。"
+            ? "已按你的要求停止处理，剩余项未执行。"
             : "全部处理完成。",
         },
         stopRequested: false,
@@ -279,6 +279,10 @@ export function batchPanelReducer(
       return {
         ...state,
         stopRequested: true,
+        progress: {
+          ...state.progress,
+          currentMessage: "正在取消当前文件，剩余项不会继续开始...",
+        },
       };
   }
 }

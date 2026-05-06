@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, XCircle } from "lucide-react";
 import { ACTION_LABELS, type ActionId } from "../lib/actionIds";
 import type { FileInfo } from "../lib/types";
-import { listenConversionProgress } from "../lib/commands";
+import { cancelJob, listenConversionProgress } from "../lib/commands";
+import { getErrorMessage } from "../lib/errors";
 import {
   formatMediaClock,
   formatProgressStage,
@@ -31,6 +32,11 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
   const [stage, setStage] = useState<string | null>(null);
   const [currentSeconds, setCurrentSeconds] = useState<number | null>(null);
   const [totalSeconds, setTotalSeconds] = useState<number | null>(null);
+  const [cancelState, setCancelState] = useState<{
+    jobId: string | null;
+    requested: boolean;
+    error: string | null;
+  }>({ jobId: null, requested: false, error: null });
 
   useEffect(() => {
     if (!jobId) {
@@ -80,6 +86,28 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
   const progressMeta = [stageLabel, displayPercent, timeRange ?? currentTimeOnly].filter(
     Boolean,
   );
+  const cancelRequested = cancelState.jobId === jobId && cancelState.requested;
+  const cancelError = cancelState.jobId === jobId ? cancelState.error : null;
+
+  async function handleCancel() {
+    if (!jobId || cancelRequested) {
+      return;
+    }
+
+    setCancelState({ jobId, requested: true, error: null });
+    setMessage("正在取消当前任务...");
+
+    try {
+      await cancelJob(jobId);
+      setMessage("已发送取消请求，正在收尾...");
+    } catch (error) {
+      setCancelState({
+        jobId,
+        requested: false,
+        error: getErrorMessage(error, "取消请求失败"),
+      });
+    }
+  }
 
   return (
     <div className="animate-fade-up text-center max-w-md">
@@ -102,6 +130,25 @@ export function Converting({ file, actionId, jobId }: ConvertingProps) {
           <p className="text-xs text-white/35 mt-1 font-mono">
             {progressMeta.join(" · ")}
           </p>
+        )}
+        {cancelError && (
+          <p className="text-xs text-danger mt-3">{cancelError}</p>
+        )}
+        {jobId && (
+          <button
+            onClick={() => {
+              void handleCancel();
+            }}
+            disabled={cancelRequested}
+            className={`no-drag mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm transition-colors ${
+              cancelRequested
+                ? "cursor-not-allowed bg-warning/10 text-warning"
+                : "cursor-pointer text-white/40 hover:text-white/70 hover:bg-white/5"
+            }`}
+          >
+            <XCircle size={15} />
+            {cancelRequested ? "正在取消..." : "取消当前任务"}
+          </button>
         )}
       </div>
     </div>
