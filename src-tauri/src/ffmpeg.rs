@@ -224,20 +224,18 @@ pub(crate) fn run_ffmpeg_with_progress(
                     last_percent = Some(percent);
                 }
             }
-            Some(FfmpegProgressUpdate::End) => {
-                if total_duration.is_some() {
-                    reporter.emit(
-                        stage,
-                        Some(progress_range.1),
-                        false,
-                        Some(message),
-                        total_duration,
-                        total_duration,
-                    );
-                    last_percent = Some(progress_range.1);
-                }
+            Some(FfmpegProgressUpdate::End) if total_duration.is_some() => {
+                reporter.emit(
+                    stage,
+                    Some(progress_range.1),
+                    false,
+                    Some(message),
+                    total_duration,
+                    total_duration,
+                );
+                last_percent = Some(progress_range.1);
             }
-            None => {}
+            Some(FfmpegProgressUpdate::End) | None => {}
         },
         |_| {},
         Some(reporter.job_registry()),
