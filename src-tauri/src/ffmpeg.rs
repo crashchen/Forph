@@ -1,8 +1,10 @@
 use std::{
     io::{self, Read},
     path::PathBuf,
-    process::{Command as StdCommand, ExitStatus, Stdio},
+    process::{Child, Command as StdCommand, ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 use crate::{
@@ -104,6 +106,25 @@ fn consume_stream_lines<R: Read>(mut reader: R, mut on_line: impl FnMut(&str)) -
     Ok(())
 }
 
+fn wait_for_child(child: &Arc<Mutex<Child>>) -> Result<ExitStatus, String> {
+    loop {
+        let status = {
+            let mut child = child
+                .lock()
+                .map_err(|_| "等待命令结束失败: 任务句柄不可用".to_string())?;
+            child
+                .try_wait()
+                .map_err(|error| format!("等待命令结束失败: {}", error))?
+        };
+
+        if let Some(status) = status {
+            return Ok(status);
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 pub(crate) fn run_command_streaming(
     mut command: StdCommand,
     mut on_stdout_line: impl FnMut(&str),
@@ -116,7 +137,6 @@ pub(crate) fn run_command_streaming(
     let mut child = command
         .spawn()
         .map_err(|e| format!("命令启动失败: {}", e))?;
-    let registration = JobRegistration::new(registry, job_id, child.id());
     let stdout = child
         .stdout
         .take()
@@ -125,6 +145,8 @@ pub(crate) fn run_command_streaming(
         .stderr
         .take()
         .ok_or_else(|| "无法读取命令错误输出".to_string())?;
+    let child = Arc::new(Mutex::new(child));
+    let registration = JobRegistration::new(registry, job_id, Arc::clone(&child));
 
     let stderr_handle = thread::spawn(move || -> Result<String, String> {
         let mut lines = Vec::new();
@@ -139,9 +161,7 @@ pub(crate) fn run_command_streaming(
     let stdout_result = consume_stream_lines(stdout, |line| {
         on_stdout_line(line);
     });
-    let status = child
-        .wait()
-        .map_err(|e| format!("等待命令结束失败: {}", e))?;
+    let status = wait_for_child(&child)?;
     let stderr = stderr_handle
         .join()
         .map_err(|_| "读取命令错误输出失败: 线程中断".to_string())??;

@@ -71,6 +71,62 @@ pub(crate) fn unique_temp_file_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
+pub(crate) fn make_temporary_output_path(final_path: &Path) -> Result<PathBuf, String> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| "无法确定临时输出目录。".to_string())?;
+    let stem = final_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "无法从输出文件名生成临时文件名。".to_string())?;
+    let extension = final_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "无法确定临时输出格式。".to_string())?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    for index in 0..1000 {
+        let candidate = parent.join(format!(
+            ".{}.forph-{}-{}-{}.{}",
+            stem,
+            std::process::id(),
+            unique,
+            index,
+            extension
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("无法生成临时输出文件名。".into())
+}
+
+pub(crate) fn discard_temporary_output(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+pub(crate) fn commit_temporary_output(temp_path: &Path, final_path: &Path) -> Result<(), String> {
+    if !temp_path.exists() {
+        return Err("转换没有生成有效的临时输出文件。".into());
+    }
+
+    if final_path.exists() {
+        discard_temporary_output(temp_path);
+        return Err("输出文件已存在，请重试生成新的文件名。".into());
+    }
+
+    std::fs::rename(temp_path, final_path).map_err(|error| {
+        discard_temporary_output(temp_path);
+        format!("写入输出文件失败: {}", error)
+    })
+}
+
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }

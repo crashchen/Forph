@@ -1,11 +1,10 @@
 use serde::Serialize;
 use std::{
     collections::{BTreeSet, HashMap},
+    process::Child,
     sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter, Manager};
-
-use crate::command_with_augmented_path;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +26,7 @@ pub(crate) struct JobRegistry {
 
 #[derive(Default)]
 struct JobRegistryState {
-    pids: HashMap<String, u32>,
+    children: HashMap<String, Arc<Mutex<Child>>>,
     cancelled: BTreeSet<String>,
 }
 
@@ -37,7 +36,7 @@ pub(crate) struct JobRegistration {
 }
 
 impl JobRegistry {
-    fn register(&self, job_id: &str, pid: u32) -> Result<(), String> {
+    fn register(&self, job_id: &str, child: Arc<Mutex<Child>>) -> Result<(), String> {
         if job_id.trim().is_empty() {
             return Ok(());
         }
@@ -46,14 +45,15 @@ impl JobRegistry {
             .state
             .lock()
             .map_err(|_| "任务注册表不可用。".to_string())?;
-        state.pids.insert(job_id.to_string(), pid);
+        state.children.insert(job_id.to_string(), child);
         state.cancelled.remove(job_id);
         Ok(())
     }
 
     fn unregister(&self, job_id: &str) {
         if let Ok(mut state) = self.state.lock() {
-            state.pids.remove(job_id);
+            state.children.remove(job_id);
+            state.cancelled.remove(job_id);
         }
     }
 
@@ -63,38 +63,42 @@ impl JobRegistry {
             return Err("任务 ID 不能为空。".into());
         }
 
-        let pid = {
+        let child = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "任务注册表不可用。".to_string())?;
-            let Some(pid) = state.pids.get(job_id).copied() else {
+            let Some(child) = state.children.get(job_id).cloned() else {
                 return Ok(false);
             };
             state.cancelled.insert(job_id.to_string());
-            pid
+            child
         };
 
-        let pid_arg = pid.to_string();
-        let output = command_with_augmented_path("kill")
-            .args(["-TERM", pid_arg.as_str()])
-            .output()
-            .map_err(|error| format!("无法发送取消请求: {}", error))?;
-
-        if output.status.success() {
-            return Ok(true);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.contains("No such process") || stderr.contains("no such process") {
+        let mut child = child
+            .lock()
+            .map_err(|_| "当前任务句柄不可用，无法取消。".to_string())?;
+        if child
+            .try_wait()
+            .map_err(|error| format!("无法检查当前任务状态: {}", error))?
+            .is_some()
+        {
+            if let Ok(mut state) = self.state.lock() {
+                state.cancelled.remove(job_id);
+            }
             return Ok(false);
         }
 
-        Err(if stderr.is_empty() {
-            "无法取消当前任务。".into()
-        } else {
-            format!("无法取消当前任务: {}", stderr)
-        })
+        match child.kill() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.cancelled.remove(job_id);
+                }
+                Ok(false)
+            }
+            Err(error) => Err(format!("无法取消当前任务: {}", error)),
+        }
     }
 
     fn take_cancelled(&self, job_id: &str) -> bool {
@@ -106,9 +110,13 @@ impl JobRegistry {
 }
 
 impl JobRegistration {
-    pub(crate) fn new(registry: Option<JobRegistry>, job_id: Option<String>, pid: u32) -> Self {
+    pub(crate) fn new(
+        registry: Option<JobRegistry>,
+        job_id: Option<String>,
+        child: Arc<Mutex<Child>>,
+    ) -> Self {
         if let (Some(registry), Some(job_id)) = (&registry, &job_id) {
-            let _ = registry.register(job_id, pid);
+            let _ = registry.register(job_id, child);
         }
 
         Self { registry, job_id }

@@ -25,7 +25,8 @@ use pdf::{build_pdf_markdown_document, extract_pdf_pages_with_pdftotext};
 use pdf::{clean_pdf_page_text, extract_clean_pdf_pages, is_pdf_list_item, normalize_pdf_raw_text};
 use progress::{JobRegistry, ProgressReporter};
 use validation::{
-    file_size, make_output_path_for_input, unique_temp_file_path, validate_existing_local_target,
+    commit_temporary_output, discard_temporary_output, file_size, make_output_path_for_input,
+    make_temporary_output_path, unique_temp_file_path, validate_existing_local_target,
     validate_input_file_path, validate_open_target_request, ValidatedOpenTarget,
 };
 use whisper::{
@@ -972,6 +973,8 @@ async fn video_to_gif(
 
     let out = make_output_path_for_input(&input, "gif")?;
     let out_str = out.to_string_lossy().to_string();
+    let temp_out = make_temporary_output_path(&out)?;
+    let temp_out_str = temp_out.to_string_lossy().to_string();
 
     let scale_filter = if width > 0 {
         format!("fps={},scale={}:-1:flags=lanczos", fps, width)
@@ -991,40 +994,47 @@ async fn video_to_gif(
         scale_filter,
         "-loop".into(),
         "0".into(),
-        out_str.clone(),
+        temp_out_str,
     ];
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path.clone());
-        run_ffmpeg_with_progress(
-            &reporter,
-            ffmpeg,
-            args,
-            "convert",
-            "正在转换 GIF...",
-            Some(clip_duration),
-            (0.0, 100.0),
-        )
-        .map_err(|details| format!("GIF 转换失败: {}", details))?;
+        let result = (|| {
+            run_ffmpeg_with_progress(
+                &reporter,
+                ffmpeg,
+                args,
+                "convert",
+                "正在转换 GIF...",
+                Some(clip_duration),
+                (0.0, 100.0),
+            )
+            .map_err(|details| format!("GIF 转换失败: {}", details))?;
+            commit_temporary_output(&temp_out, &out)?;
 
-        reporter.emit(
-            "convert",
-            Some(100.0),
-            false,
-            Some("GIF 转换完成"),
-            Some(clip_duration),
-            Some(clip_duration),
-        );
+            reporter.emit(
+                "convert",
+                Some(100.0),
+                false,
+                Some("GIF 转换完成"),
+                Some(clip_duration),
+                Some(clip_duration),
+            );
 
-        Ok(ConversionResult {
-            output_path: out_str,
-            output_size: file_size(&out),
-            message: format!(
-                "GIF 转换完成（{:.1}s - {:.1}s）",
-                start,
-                start + clip_duration
-            ),
-        })
+            Ok(ConversionResult {
+                output_path: out_str,
+                output_size: file_size(&out),
+                message: format!(
+                    "GIF 转换完成（{:.1}s - {:.1}s）",
+                    start,
+                    start + clip_duration
+                ),
+            })
+        })();
+        if result.is_err() {
+            discard_temporary_output(&temp_out);
+        }
+        result
     })
     .await
     .map_err(|error| format!("GIF 任务执行失败: {}", error))?
@@ -1046,6 +1056,8 @@ async fn extract_audio(
     let total_duration = probe_media_info(&input_path).and_then(|info| info.duration_seconds);
     let out = make_output_path_for_input(&input, &output_format)?;
     let out_str = out.to_string_lossy().to_string();
+    let temp_out = make_temporary_output_path(&out)?;
+    let temp_out_str = temp_out.to_string_lossy().to_string();
 
     let args: Vec<String> = match output_format.as_str() {
         "mp3" => vec![
@@ -1057,7 +1069,7 @@ async fn extract_audio(
             "libmp3lame".into(),
             "-q:a".into(),
             "2".into(),
-            out_str.clone(),
+            temp_out_str.clone(),
         ],
         "wav" => vec![
             "-y".into(),
@@ -1066,38 +1078,45 @@ async fn extract_audio(
             "-vn".into(),
             "-acodec".into(),
             "pcm_s16le".into(),
-            out_str.clone(),
+            temp_out_str,
         ],
         _ => return Err(format!("不支持的音频格式: {}", output_format)),
     };
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path);
-        run_ffmpeg_with_progress(
-            &reporter,
-            ffmpeg,
-            args,
-            "extract",
-            "正在提取音频...",
-            total_duration,
-            (0.0, 100.0),
-        )
-        .map_err(|details| format!("音频提取失败: {}", details))?;
+        let result = (|| {
+            run_ffmpeg_with_progress(
+                &reporter,
+                ffmpeg,
+                args,
+                "extract",
+                "正在提取音频...",
+                total_duration,
+                (0.0, 100.0),
+            )
+            .map_err(|details| format!("音频提取失败: {}", details))?;
+            commit_temporary_output(&temp_out, &out)?;
 
-        reporter.emit(
-            "extract",
-            Some(100.0),
-            false,
-            Some("音频提取完成"),
-            total_duration,
-            total_duration,
-        );
+            reporter.emit(
+                "extract",
+                Some(100.0),
+                false,
+                Some("音频提取完成"),
+                total_duration,
+                total_duration,
+            );
 
-        Ok(ConversionResult {
-            output_path: out_str,
-            output_size: file_size(&out),
-            message: "音频提取完成".into(),
-        })
+            Ok(ConversionResult {
+                output_path: out_str,
+                output_size: file_size(&out),
+                message: "音频提取完成".into(),
+            })
+        })();
+        if result.is_err() {
+            discard_temporary_output(&temp_out);
+        }
+        result
     })
     .await
     .map_err(|error| format!("音频提取任务执行失败: {}", error))?
@@ -1127,6 +1146,8 @@ async fn compress_video(
 
     let out = make_output_path_for_input(&input, "mp4")?;
     let out_str = out.to_string_lossy().to_string();
+    let temp_out = make_temporary_output_path(&out)?;
+    let temp_out_str = temp_out.to_string_lossy().to_string();
 
     let mut args: Vec<String> = vec![
         "-y".into(),
@@ -1151,36 +1172,43 @@ async fn compress_video(
         "aac".into(),
         "-b:a".into(),
         "128k".into(),
-        out_str.clone(),
+        temp_out_str,
     ]);
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path);
-        run_ffmpeg_with_progress(
-            &reporter,
-            ffmpeg,
-            args,
-            "compress",
-            "正在压缩视频...",
-            total_duration,
-            (0.0, 100.0),
-        )
-        .map_err(|details| format!("视频压缩失败: {}", details))?;
+        let result = (|| {
+            run_ffmpeg_with_progress(
+                &reporter,
+                ffmpeg,
+                args,
+                "compress",
+                "正在压缩视频...",
+                total_duration,
+                (0.0, 100.0),
+            )
+            .map_err(|details| format!("视频压缩失败: {}", details))?;
+            commit_temporary_output(&temp_out, &out)?;
 
-        reporter.emit(
-            "compress",
-            Some(100.0),
-            false,
-            Some("视频压缩完成"),
-            total_duration,
-            total_duration,
-        );
+            reporter.emit(
+                "compress",
+                Some(100.0),
+                false,
+                Some("视频压缩完成"),
+                total_duration,
+                total_duration,
+            );
 
-        Ok(ConversionResult {
-            output_path: out_str,
-            output_size: file_size(&out),
-            message: "视频压缩完成".into(),
-        })
+            Ok(ConversionResult {
+                output_path: out_str,
+                output_size: file_size(&out),
+                message: "视频压缩完成".into(),
+            })
+        })();
+        if result.is_err() {
+            discard_temporary_output(&temp_out);
+        }
+        result
     })
     .await
     .map_err(|error| format!("视频压缩任务执行失败: {}", error))?
@@ -1232,9 +1260,11 @@ async fn transcribe_audio(
 
     let out = make_output_path_for_input(&input, file_ext)?;
     let out_str = out.to_string_lossy().to_string();
-    let of_base = out_str
+    let temp_out = make_temporary_output_path(&out)?;
+    let temp_out_str = temp_out.to_string_lossy().to_string();
+    let temp_of_base = temp_out_str
         .strip_suffix(&format!(".{}", file_ext))
-        .unwrap_or(&out_str)
+        .unwrap_or(&temp_out_str)
         .to_string();
     let use_mixed_language_mode = mixed_language_mode.unwrap_or(false)
         && language == "auto"
@@ -1278,7 +1308,7 @@ async fn transcribe_audio(
                     &tmp_wav,
                     whisper_output_flag,
                     &fmt,
-                    &out,
+                    &temp_out,
                     total_duration.unwrap_or_default(),
                 )?;
             } else {
@@ -1286,7 +1316,7 @@ async fn transcribe_audio(
                     &model_path,
                     &tmp_wav,
                     whisper_output_flag,
-                    Path::new(&of_base),
+                    Path::new(&temp_of_base),
                     &language,
                     false,
                 );
@@ -1300,6 +1330,8 @@ async fn transcribe_audio(
                 )
                 .map_err(|details| format!("转写失败: {}", details))?;
             }
+
+            commit_temporary_output(&temp_out, &out)?;
 
             reporter.emit(
                 "finalize",
@@ -1323,6 +1355,9 @@ async fn transcribe_audio(
         })();
 
         let _ = std::fs::remove_file(&tmp_wav);
+        if transcription.is_err() {
+            discard_temporary_output(&temp_out);
+        }
         transcription
     })
     .await
@@ -1516,9 +1551,10 @@ pub fn run() {
 mod tests {
     use super::{
         build_markdown_document, build_pdf_markdown_document, clamp_gif_window,
-        clean_pdf_page_text, compression_scale_filter, escape_html_text, extract_clean_pdf_pages,
-        extract_pdf_pages_with_pdftotext, find_downloaded_model_candidate_in_dir, is_pdf_list_item,
-        make_output_path_for_input, max_long_edge_for_resolution, merge_srt_outputs,
+        clean_pdf_page_text, commit_temporary_output, compression_scale_filter, escape_html_text,
+        extract_clean_pdf_pages, extract_pdf_pages_with_pdftotext,
+        find_downloaded_model_candidate_in_dir, is_pdf_list_item, make_output_path_for_input,
+        make_temporary_output_path, max_long_edge_for_resolution, merge_srt_outputs,
         merge_vtt_outputs, normalize_detected_language_label, normalize_pdf_raw_text,
         normalize_speech_segments, normalized_transcription_language,
         normalized_transcription_model, normalized_transcription_output_format,
@@ -1675,6 +1711,47 @@ mod tests {
         assert_eq!(
             make_output_path_for_input(&input, "txt").expect("output path"),
             temp_dir.join("demo_1.txt")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn builds_temporary_output_next_to_final_path() {
+        let temp_dir = temp_test_path("temp-output-dir");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let final_path = temp_dir.join("movie.mp4");
+
+        let temp_path = make_temporary_output_path(&final_path).expect("temp output path");
+
+        assert_eq!(temp_path.parent(), Some(temp_dir.as_path()));
+        assert_eq!(
+            temp_path.extension().and_then(|value| value.to_str()),
+            Some("mp4")
+        );
+        assert!(temp_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .starts_with(".movie.forph-"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn commits_temporary_output_to_final_path() {
+        let temp_dir = temp_test_path("commit-output-dir");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let final_path = temp_dir.join("audio.mp3");
+        let temp_path = make_temporary_output_path(&final_path).expect("temp output path");
+        fs::write(&temp_path, b"finished").expect("write temp output");
+
+        commit_temporary_output(&temp_path, &final_path).expect("commit temp output");
+
+        assert!(!temp_path.exists());
+        assert_eq!(
+            fs::read(&final_path).expect("read final output"),
+            b"finished"
         );
 
         let _ = fs::remove_dir_all(temp_dir);
