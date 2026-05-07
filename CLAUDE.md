@@ -27,7 +27,12 @@ src/                          React + TS frontend
     types.ts, format.ts, errors.ts
 
 src-tauri/
-  src/lib.rs                  ~3400 lines — ALL Rust logic lives here today
+  src/lib.rs                  Tauri command wiring plus remaining media / whisper helpers
+  src/ffmpeg.rs               FFmpeg progress parsing, streaming process runner, GIF/compress helpers
+  src/pdf.rs                  PDF text extraction, cleaning, and Markdown wrapping helpers
+  src/progress.rs             progress events, job registry, and cancellation support
+  src/validation.rs           local path validation, output paths, and open/reveal target checks
+  src/whisper.rs              transcription params, whisper progress, mixed-language segmentation/merge
   src/main.rs                 thin entry, calls app_lib::run()
   capabilities/default.json   Tauri ACL: core, window:start-dragging, dialog, drag
   tauri.conf.json             macOSPrivateApi: true, transparent window with sidebar effect
@@ -87,7 +92,7 @@ Because the app uses `macOSPrivateApi`, **Mac App Store distribution is not a go
 
 ## Known issues / pitfalls
 
-- **`lib.rs` is monolithic (~3400 lines).** Splitting into modules (`commands/`, `ffmpeg`, `whisper`, `pdf`, `paths`, `validation`, `progress`) is a known refactor target — keep new code organized so the eventual split is mechanical, not semantic.
+- **`lib.rs` still contains the Tauri command orchestration chain.** Shared `pdf`, `ffmpeg`, `progress`, `validation`, and `whisper` helpers are split out; future refactors should keep command wiring thin rather than moving UI-facing behaviour around.
 - **New file commands should validate at the boundary.** Existing conversion commands canonicalize through `validate_input_file_path`, and output files should be created through `make_output_path_for_input`. Keep that pattern when adding commands that accept paths from the frontend.
 - **`lucide-react@^1.7.0` is unusual.** Modern lucide-react versions are 0.x. Confirm the pinned major matches what's actually on npm before upgrading; the icon set in this version is small.
 - **Progress listener pattern** in `BatchPanel` and `Converting` uses `let disposed = false; ...then(fn => disposed ? fn() : unlisten = fn)`. This is the deliberate idiom — don't "fix" it without confirming a real leak.
