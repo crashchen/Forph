@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    process::{Command as StdCommand, ExitStatus},
     sync::{Arc, Mutex},
 };
 
@@ -26,6 +27,13 @@ struct SubtitleCue {
     start_ms: u64,
     end_ms: u64,
     text: String,
+}
+
+struct RegisteredCommandOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    cancelled: bool,
 }
 
 const MIXED_LANGUAGE_PADDING_MS: u64 = 200;
@@ -591,20 +599,43 @@ fn display_language_label(language: &str) -> &str {
     }
 }
 
+fn run_registered_command(
+    reporter: &ProgressReporter,
+    command: StdCommand,
+) -> Result<RegisteredCommandOutput, String> {
+    let mut stdout_lines = Vec::new();
+    let output = run_command_streaming(
+        command,
+        |line| stdout_lines.push(line.to_string()),
+        |_| {},
+        Some(reporter.job_registry()),
+        reporter.job_id(),
+    )?;
+
+    Ok(RegisteredCommandOutput {
+        status: output.status,
+        stdout: stdout_lines.join("\n"),
+        stderr: output.stderr,
+        cancelled: output.cancelled,
+    })
+}
+
 fn run_whisper_language_detection(
+    reporter: &ProgressReporter,
     whisper_cmd: &Path,
     model_path: &Path,
     input_wav: &Path,
 ) -> Result<Option<String>, String> {
-    let output = command_with_augmented_path(whisper_cmd)
-        .args(build_whisper_language_detection_args(model_path, input_wav))
-        .output()
+    let mut command = command_with_augmented_path(whisper_cmd);
+    command.args(build_whisper_language_detection_args(model_path, input_wav));
+    let output = run_registered_command(reporter, command)
         .map_err(|error| format!("语言检测命令执行失败: {}", error))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}\n{stderr}");
+    if output.cancelled {
+        return Err("任务已取消".into());
+    }
 
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
     if !output.status.success() {
         let details = combined.trim();
         return Err(if details.is_empty() {
@@ -791,6 +822,7 @@ pub(crate) fn normalize_speech_segments(
 }
 
 fn detect_speech_segments(
+    reporter: &ProgressReporter,
     ffmpeg: &Path,
     input_wav: &Path,
     total_duration_ms: u64,
@@ -803,26 +835,26 @@ fn detect_speech_segments(
         "silencedetect=noise={}:d={}",
         MIXED_LANGUAGE_SILENCE_THRESHOLD, MIXED_LANGUAGE_SILENCE_DURATION_SECONDS
     );
-    let output = command_with_augmented_path(ffmpeg)
-        .args(vec![
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "info".into(),
-            "-nostats".into(),
-            "-i".into(),
-            input_wav.to_string_lossy().to_string(),
-            "-af".into(),
-            silence_filter,
-            "-f".into(),
-            "null".into(),
-            "-".into(),
-        ])
-        .output();
+    let mut command = command_with_augmented_path(ffmpeg);
+    command.args(vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "info".into(),
+        "-nostats".into(),
+        "-i".into(),
+        input_wav.to_string_lossy().to_string(),
+        "-af".into(),
+        silence_filter,
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
 
-    let raw_segments = match output {
+    let raw_segments = match run_registered_command(reporter, command) {
+        Ok(result) if result.cancelled => return Err("任务已取消".into()),
         Ok(result) if result.status.success() => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let events = stderr
+            let events = result
+                .stderr
                 .lines()
                 .filter_map(parse_silencedetect_event_line)
                 .collect::<Vec<_>>();
@@ -840,6 +872,7 @@ fn detect_speech_segments(
 }
 
 fn extract_segment_audio(
+    reporter: &ProgressReporter,
     ffmpeg: &Path,
     input_wav: &Path,
     output_wav: &Path,
@@ -847,28 +880,32 @@ fn extract_segment_audio(
 ) -> Result<(), String> {
     let duration_seconds = millis_to_seconds(segment.duration_ms);
     let start_seconds = millis_to_seconds(segment.absolute_start_ms);
-    let output = command_with_augmented_path(ffmpeg)
-        .args(vec![
-            "-y".into(),
-            "-ss".into(),
-            format!("{start_seconds:.3}"),
-            "-t".into(),
-            format!("{duration_seconds:.3}"),
-            "-i".into(),
-            input_wav.to_string_lossy().to_string(),
-            "-ar".into(),
-            "16000".into(),
-            "-ac".into(),
-            "1".into(),
-            "-c:a".into(),
-            "pcm_s16le".into(),
-            output_wav.to_string_lossy().to_string(),
-        ])
-        .output()
+    let mut command = command_with_augmented_path(ffmpeg);
+    command.args(vec![
+        "-y".into(),
+        "-ss".into(),
+        format!("{start_seconds:.3}"),
+        "-t".into(),
+        format!("{duration_seconds:.3}"),
+        "-i".into(),
+        input_wav.to_string_lossy().to_string(),
+        "-ar".into(),
+        "16000".into(),
+        "-ac".into(),
+        "1".into(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        output_wav.to_string_lossy().to_string(),
+    ]);
+    let output = run_registered_command(reporter, command)
         .map_err(|error| format!("切出音频片段失败: {}", error))?;
 
+    if output.cancelled {
+        return Err("任务已取消".into());
+    }
+
     if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let details = output.stderr.trim().to_string();
         return Err(if details.is_empty() {
             "切出音频片段失败".into()
         } else {
@@ -905,7 +942,7 @@ pub(crate) fn run_mixed_language_transcription(
         Some(total_duration_seconds),
     );
 
-    let segments = detect_speech_segments(ffmpeg, input_wav, total_duration_ms)?;
+    let segments = detect_speech_segments(reporter, ffmpeg, input_wav, total_duration_ms)?;
     if segments.is_empty() {
         return Err("没有识别出可转写的语音片段。".into());
     }
@@ -934,7 +971,7 @@ pub(crate) fn run_mixed_language_transcription(
             let detect_progress_end =
                 segment_progress_start + ((segment_progress_end - segment_progress_start) * 0.2);
 
-            extract_segment_audio(ffmpeg, input_wav, &segment_wav, &segment)?;
+            extract_segment_audio(reporter, ffmpeg, input_wav, &segment_wav, &segment)?;
 
             reporter.emit(
                 "detect",
@@ -949,9 +986,16 @@ pub(crate) fn run_mixed_language_transcription(
                 Some(total_duration_seconds),
             );
 
-            let detected_language =
-                run_whisper_language_detection(whisper_cmd, model_path, &segment_wav)
-                    .unwrap_or(None);
+            let detected_language = match run_whisper_language_detection(
+                reporter,
+                whisper_cmd,
+                model_path,
+                &segment_wav,
+            ) {
+                Ok(language) => language,
+                Err(error) if error.contains("任务已取消") => return Err(error),
+                Err(_) => None,
+            };
             let language_to_use = detected_language
                 .as_deref()
                 .and_then(normalize_detected_language_label)

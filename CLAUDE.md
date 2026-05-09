@@ -48,8 +48,8 @@ src-tauri/
 - All backend calls go through `src/lib/commands.ts`. Don't call `invoke()` directly from components.
 - Action IDs are the contract between Rust (`build_actions` in `lib.rs`) and TS (`ACTION_IDS` in `actionIds.ts`). When you add an action, update **both** sides; `getFileInfo()` validates incoming IDs via `isActionId()` and throws on mismatch.
 - Long-running operations emit progress on the `forph://conversion-progress` Tauri event. Each call passes a `jobId` so the listener can filter to its own job. See `REALTIME_ACTION_IDS` for which actions emit progress.
-- Long-running ffmpeg / whisper jobs are registered in `JobRegistry` by `jobId` with a Rust `Child` handle. Use `cancel_job(jobId)` for UI cancellation instead of PID-based shell kills or a second cancellation path.
-- Long-running media outputs are written to hidden temporary files next to the final output and committed only after success. Keep this temp-output + rename pattern for new ffmpeg / whisper commands so cancelled jobs do not leave half-written files.
+- Long-running ffmpeg / whisper jobs are registered in `JobRegistry` by `jobId` with a Rust `Child` handle. Use `cancel_job(jobId)` for UI cancellation instead of PID-based shell kills or a second cancellation path. Mixed-language transcription subcommands must also go through the registered streaming helper, not raw `.output()`.
+- Long-running media outputs are written to hidden temporary files next to the final output and committed only after success. Keep this `TemporaryOutputGuard` + rename pattern for new ffmpeg / whisper commands so cancelled jobs, errors, and panics do not leave half-written files.
 - All Rust commands return `Result<T, String>` — error messages are user-facing Chinese strings; the frontend forwards them via `getErrorMessage()` without translation.
 
 ## External tool discovery

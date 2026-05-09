@@ -127,6 +127,35 @@ pub(crate) fn commit_temporary_output(temp_path: &Path, final_path: &Path) -> Re
     })
 }
 
+pub(crate) struct TemporaryOutputGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryOutputGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn commit(mut self, final_path: &Path) -> Result<(), String> {
+        commit_temporary_output(&self.path, final_path)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryOutputGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            discard_temporary_output(&self.path);
+        }
+    }
+}
+
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }

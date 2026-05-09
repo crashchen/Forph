@@ -165,7 +165,7 @@ pub(crate) fn run_command_streaming(
     let stderr = stderr_handle
         .join()
         .map_err(|_| "读取命令错误输出失败: 线程中断".to_string())??;
-    let cancelled = registration.was_cancelled();
+    let cancelled = registration.was_cancelled() && !status.success();
 
     if cancelled {
         return Ok(StreamCommandOutput {

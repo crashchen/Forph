@@ -24,10 +24,12 @@ use pdf::{build_pdf_markdown_document, extract_pdf_pages_with_pdftotext};
 #[cfg(test)]
 use pdf::{clean_pdf_page_text, extract_clean_pdf_pages, is_pdf_list_item, normalize_pdf_raw_text};
 use progress::{JobRegistry, ProgressReporter};
+#[cfg(test)]
+use validation::commit_temporary_output;
 use validation::{
-    commit_temporary_output, discard_temporary_output, file_size, make_output_path_for_input,
-    make_temporary_output_path, unique_temp_file_path, validate_existing_local_target,
-    validate_input_file_path, validate_open_target_request, ValidatedOpenTarget,
+    file_size, make_output_path_for_input, make_temporary_output_path, unique_temp_file_path,
+    validate_existing_local_target, validate_input_file_path, validate_open_target_request,
+    TemporaryOutputGuard, ValidatedOpenTarget,
 };
 use whisper::{
     build_whisper_args, normalized_transcription_language, normalized_transcription_model,
@@ -999,42 +1001,37 @@ async fn video_to_gif(
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path.clone());
-        let result = (|| {
-            run_ffmpeg_with_progress(
-                &reporter,
-                ffmpeg,
-                args,
-                "convert",
-                "正在转换 GIF...",
-                Some(clip_duration),
-                (0.0, 100.0),
-            )
-            .map_err(|details| format!("GIF 转换失败: {}", details))?;
-            commit_temporary_output(&temp_out, &out)?;
+        let temp_output = TemporaryOutputGuard::new(temp_out);
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "convert",
+            "正在转换 GIF...",
+            Some(clip_duration),
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("GIF 转换失败: {}", details))?;
+        temp_output.commit(&out)?;
 
-            reporter.emit(
-                "convert",
-                Some(100.0),
-                false,
-                Some("GIF 转换完成"),
-                Some(clip_duration),
-                Some(clip_duration),
-            );
+        reporter.emit(
+            "convert",
+            Some(100.0),
+            false,
+            Some("GIF 转换完成"),
+            Some(clip_duration),
+            Some(clip_duration),
+        );
 
-            Ok(ConversionResult {
-                output_path: out_str,
-                output_size: file_size(&out),
-                message: format!(
-                    "GIF 转换完成（{:.1}s - {:.1}s）",
-                    start,
-                    start + clip_duration
-                ),
-            })
-        })();
-        if result.is_err() {
-            discard_temporary_output(&temp_out);
-        }
-        result
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: format!(
+                "GIF 转换完成（{:.1}s - {:.1}s）",
+                start,
+                start + clip_duration
+            ),
+        })
     })
     .await
     .map_err(|error| format!("GIF 任务执行失败: {}", error))?
@@ -1085,38 +1082,33 @@ async fn extract_audio(
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path);
-        let result = (|| {
-            run_ffmpeg_with_progress(
-                &reporter,
-                ffmpeg,
-                args,
-                "extract",
-                "正在提取音频...",
-                total_duration,
-                (0.0, 100.0),
-            )
-            .map_err(|details| format!("音频提取失败: {}", details))?;
-            commit_temporary_output(&temp_out, &out)?;
+        let temp_output = TemporaryOutputGuard::new(temp_out);
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "extract",
+            "正在提取音频...",
+            total_duration,
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("音频提取失败: {}", details))?;
+        temp_output.commit(&out)?;
 
-            reporter.emit(
-                "extract",
-                Some(100.0),
-                false,
-                Some("音频提取完成"),
-                total_duration,
-                total_duration,
-            );
+        reporter.emit(
+            "extract",
+            Some(100.0),
+            false,
+            Some("音频提取完成"),
+            total_duration,
+            total_duration,
+        );
 
-            Ok(ConversionResult {
-                output_path: out_str,
-                output_size: file_size(&out),
-                message: "音频提取完成".into(),
-            })
-        })();
-        if result.is_err() {
-            discard_temporary_output(&temp_out);
-        }
-        result
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: "音频提取完成".into(),
+        })
     })
     .await
     .map_err(|error| format!("音频提取任务执行失败: {}", error))?
@@ -1177,38 +1169,33 @@ async fn compress_video(
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path);
-        let result = (|| {
-            run_ffmpeg_with_progress(
-                &reporter,
-                ffmpeg,
-                args,
-                "compress",
-                "正在压缩视频...",
-                total_duration,
-                (0.0, 100.0),
-            )
-            .map_err(|details| format!("视频压缩失败: {}", details))?;
-            commit_temporary_output(&temp_out, &out)?;
+        let temp_output = TemporaryOutputGuard::new(temp_out);
+        run_ffmpeg_with_progress(
+            &reporter,
+            ffmpeg,
+            args,
+            "compress",
+            "正在压缩视频...",
+            total_duration,
+            (0.0, 100.0),
+        )
+        .map_err(|details| format!("视频压缩失败: {}", details))?;
+        temp_output.commit(&out)?;
 
-            reporter.emit(
-                "compress",
-                Some(100.0),
-                false,
-                Some("视频压缩完成"),
-                total_duration,
-                total_duration,
-            );
+        reporter.emit(
+            "compress",
+            Some(100.0),
+            false,
+            Some("视频压缩完成"),
+            total_duration,
+            total_duration,
+        );
 
-            Ok(ConversionResult {
-                output_path: out_str,
-                output_size: file_size(&out),
-                message: "视频压缩完成".into(),
-            })
-        })();
-        if result.is_err() {
-            discard_temporary_output(&temp_out);
-        }
-        result
+        Ok(ConversionResult {
+            output_path: out_str,
+            output_size: file_size(&out),
+            message: "视频压缩完成".into(),
+        })
     })
     .await
     .map_err(|error| format!("视频压缩任务执行失败: {}", error))?
@@ -1272,6 +1259,7 @@ async fn transcribe_audio(
 
     tauri::async_runtime::spawn_blocking(move || {
         let reporter = ProgressReporter::new(app, job_id, input_path.clone());
+        let temp_output = TemporaryOutputGuard::new(temp_out);
         let transcription = (|| {
             run_ffmpeg_with_progress(
                 &reporter,
@@ -1308,7 +1296,7 @@ async fn transcribe_audio(
                     &tmp_wav,
                     whisper_output_flag,
                     &fmt,
-                    &temp_out,
+                    temp_output.path(),
                     total_duration.unwrap_or_default(),
                 )?;
             } else {
@@ -1331,7 +1319,7 @@ async fn transcribe_audio(
                 .map_err(|details| format!("转写失败: {}", details))?;
             }
 
-            commit_temporary_output(&temp_out, &out)?;
+            temp_output.commit(&out)?;
 
             reporter.emit(
                 "finalize",
@@ -1355,9 +1343,6 @@ async fn transcribe_audio(
         })();
 
         let _ = std::fs::remove_file(&tmp_wav);
-        if transcription.is_err() {
-            discard_temporary_output(&temp_out);
-        }
         transcription
     })
     .await
@@ -1561,7 +1546,7 @@ mod tests {
         parse_detected_language, parse_ffmpeg_progress_line, parse_silencedetect_event_line,
         parse_whisper_progress_percent, pdftotext_command_path, speech_segment, strip_frontmatter,
         validate_existing_local_target, validate_input_file_path, validate_open_target_request,
-        FfmpegProgressUpdate, SilenceEvent, ValidatedOpenTarget,
+        FfmpegProgressUpdate, SilenceEvent, TemporaryOutputGuard, ValidatedOpenTarget,
     };
     use std::{
         fs,
@@ -1753,6 +1738,23 @@ mod tests {
             fs::read(&final_path).expect("read final output"),
             b"finished"
         );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn temporary_output_guard_discards_when_dropped() {
+        let temp_dir = temp_test_path("guard-output-dir");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let final_path = temp_dir.join("video.mp4");
+        let temp_path = make_temporary_output_path(&final_path).expect("temp output path");
+        fs::write(&temp_path, b"partial").expect("write temp output");
+
+        {
+            let _guard = TemporaryOutputGuard::new(temp_path.clone());
+        }
+
+        assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(temp_dir);
     }
